@@ -9,7 +9,7 @@ A Rust rewrite of the [NPPS4-DLAPI reference implementation](https://github.com/
 The original Python/FastAPI implementation is preserved upstream. This fork rewrites the server in Rust for:
 
 - **Memory safety** — Rust's ownership model eliminates entire classes of memory vulnerabilities (use-after-free, buffer overflows) at compile time, with no runtime GC pauses.
-- **Single binary deployment** — `cargo build --release` produces one self-contained binary. No Python interpreter, no venv, no pip.
+- **Single binary deployment** — `cargo build --release` produces one self-contained binary. No Python interpreter, no venv, no pip. Game database decryption (honkypy V2/V3/V4) is implemented natively in Rust — no external tools required at runtime.
 - **Lower resource usage** — significantly lower memory footprint and faster cold starts than uvicorn/FastAPI.
 - **Security hardened** — path traversal protection, input sanitization, and request size limits built in. See [Security](#security).
 
@@ -134,7 +134,7 @@ Upgrades a generation 1.0 archive to generation 1.1, which is required before ru
 - Scans all update and package directories
 - Computes MD5/SHA256 hashes and writes `infov2.json` metadata files
 - Extracts micro-download files from package type 4 archives
-- Decrypts game databases (requires `honoka2` binary in PATH, or `python -m honkypy`)
+- Decrypts game databases using a native Rust implementation of the honkypy algorithm (no external tools required)
 
 ```bash
 n4dlapi upgrade /path/to/archive-root

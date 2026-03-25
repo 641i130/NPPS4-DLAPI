@@ -18,23 +18,12 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "clippy" "rustfmt" ];
         };
-        honkypy = pkgs.python3Packages.buildPythonPackage {
-          pname = "honkypy";
-          version = "0.2.0";
-          format = "wheel";
-          src = pkgs.fetchurl {
-            url = "https://github.com/DarkEnergyProcessor/honky-py/releases/download/0.2.0/honkypy-0.2.0-py3-none-any.whl";
-            sha256 = "02dijp5j0fs0js1rf0qaicq4zc0npx0wrmyvib95vvqvsbkzmwgy";
-          };
-        };
-        pythonWithHonkypy = pkgs.python3.withPackages (_: [ honkypy ]);
       in {
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
             rustToolchain
             pkgs.cargo-watch
             pkgs.pkg-config
-            pythonWithHonkypy
           ];
 
           buildInputs = [
