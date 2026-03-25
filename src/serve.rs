@@ -31,7 +31,7 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::info;
 
 use crate::config::Config;
-use crate::file_handler::FileState;
+use crate::file_handler::{sanitize_path, FileState};
 use crate::models::*;
 
 // ── Program version constants ──────────────────────────────────────────────────
@@ -328,6 +328,56 @@ async fn release_info_handler(State(state): State<AppState>) -> impl IntoRespons
     }
 }
 
+// ── Legacy /v7 micro-download route ───────────────────────────────────────────
+
+/// GET /v7/micro_download/:platform/:version/*file_path
+///
+/// Reverse-maps the old v7 CDN path format to the current archive-root layout:
+///   /v7/micro_download/{platform}/{version}/{file}
+///   → {archive_root}/{Platform}/package/{version}/microdl/{file}
+async fn v7_microdl_handler(
+    State(state): State<AppState>,
+    Path((platform, version, file_path)): Path<(String, String, String)>,
+) -> Response {
+    let platform_dir = match platform.to_lowercase().as_str() {
+        "android" => "Android",
+        "ios" => "iOS",
+        _ => {
+            return (StatusCode::NOT_FOUND, Json(ErrorResponseModel { detail: "Not found.".into() }))
+                .into_response();
+        }
+    };
+
+    // Sanitize version: only digits and dots
+    let version_clean: String = version.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+
+    let sanitized_file = sanitize_path(&file_path);
+    if sanitized_file.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(ErrorResponseModel { detail: "Not found.".into() }))
+            .into_response();
+    }
+
+    let fs_path = state.files.archive_root
+        .join(platform_dir)
+        .join("package")
+        .join(&version_clean)
+        .join("microdl")
+        .join(&sanitized_file);
+
+    match tokio::fs::read(&fs_path).await {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(data))
+            .unwrap(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, Json(ErrorResponseModel { detail: "Not found.".into() }))
+                .into_response()
+        }
+        Err(_) => internal_error(),
+    }
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────────
 
 pub async fn run() -> anyhow::Result<()> {
@@ -378,7 +428,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Static file serving for the CDN archive root
     let static_routes = Router::new()
-        .nest_service("/archive-root", ServeDir::new(&archive_root));
+        .nest_service("/archive-root", ServeDir::new(&archive_root))
+        .route("/v7/micro_download/:platform/:version/*file_path", get(v7_microdl_handler));
 
     let app = Router::new()
         .merge(api_routes)

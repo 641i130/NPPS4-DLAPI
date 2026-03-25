@@ -407,7 +407,7 @@ impl FileState {
 /// - Remove `..` occurrences
 /// - Collect only Normal path components (strips leading `/`, `.`, etc.)
 /// - Re-join with `/`
-fn sanitize_path(file_path: &str) -> String {
+pub fn sanitize_path(file_path: &str) -> String {
     let no_dotdot = file_path.replace("..", "");
     let mut components = Vec::new();
     for part in Path::new(&no_dotdot).components() {
