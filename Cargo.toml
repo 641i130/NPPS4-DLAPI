@@ -1,0 +1,45 @@
+[package]
+name = "n4dlapi"
+version = "0.1.0"
+edition = "2021"
+description = "NPPS4-DLAPI - Download API server and tools for Love Live SIF game assets (Rust rewrite)"
+
+[[bin]]
+name = "n4dlapi"
+path = "src/main.rs"
+
+[dependencies]
+# Server
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "0.8", features = ["preserve_order"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client (clone)
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# Archive handling (upgrade/clone)
+zip = "2"
+
+# Hashing (upgrade/clone)
+md-5 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+
+# URL encoding (clone shared key)
+urlencoding = "2"
+
+# Temp files (honkypy fallback)
+tempfile = "3"
+
+# General
+anyhow = "1"
