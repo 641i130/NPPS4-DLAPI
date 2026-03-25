@@ -21,9 +21,8 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 use anyhow::{anyhow, Context};
@@ -350,64 +349,6 @@ fn prehash_packages(root: &Path, platform: &str) -> anyhow::Result<()> {
 
 // ── Database decryption ────────────────────────────────────────────────────────
 
-/// Decrypt a SIF database file.
-/// Tries `honoka2 -b {basename} - -` (stdin→stdout) first, then falls back to
-/// `python -m honkypy` / `python3 -m honkypy` using a temp directory.
 fn decrypt_db(basename: &str, encrypted: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if let Ok(result) = try_honoka2(basename, encrypted) {
-        return Ok(result);
-    }
-    decrypt_via_honkypy(basename, encrypted)
-}
-
-fn try_honoka2(basename: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut child = Command::new("honoka2")
-        .args(["-b", basename, "-", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("honoka2 not found")?;
-
-    // Write stdin in a separate thread to avoid deadlock with stdout.
-    let data_owned = data.to_vec();
-    let mut stdin = child.stdin.take().unwrap();
-    let writer = std::thread::spawn(move || stdin.write_all(&data_owned));
-
-    let out = child.wait_with_output().context("honoka2 wait failed")?;
-    writer.join().map_err(|_| anyhow!("stdin writer thread panicked"))??;
-
-    if !out.status.success() {
-        return Err(anyhow!("honoka2 exited with status {}", out.status));
-    }
-    Ok(out.stdout)
-}
-
-fn decrypt_via_honkypy(basename: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use tempfile::tempdir;
-
-    // honkypy derives the decryption key from the filename, so the temp input
-    // file must have the correct basename.
-    let dir = tempdir()?;
-    let in_path = dir.path().join(basename);
-    let out_path = dir.path().join(format!("{basename}.out"));
-    fs::write(&in_path, data)?;
-
-    let args = [
-        "-m",
-        "honkypy",
-        in_path.to_str().unwrap(),
-        out_path.to_str().unwrap(),
-    ];
-
-    let status = Command::new("python")
-        .args(args)
-        .status()
-        .or_else(|_| Command::new("python3").args(args).status())
-        .context("python -m honkypy not found; install honkypy or provide honoka2 binary")?;
-
-    if !status.success() {
-        return Err(anyhow!("honkypy decryption failed for {basename}"));
-    }
-    Ok(fs::read(&out_path)?)
+    crate::honkypy::decrypt(basename, encrypted)
 }

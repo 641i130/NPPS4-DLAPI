@@ -38,8 +38,5 @@ hex = "0.4"
 # URL encoding (clone shared key)
 urlencoding = "2"
 
-# Temp files (honkypy fallback)
-tempfile = "3"
-
 # General
 anyhow = "1"

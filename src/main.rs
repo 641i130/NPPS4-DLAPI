@@ -19,6 +19,7 @@
 mod clone_cmd;
 mod config;
 mod file_handler;
+mod honkypy;
 mod models;
 mod serve;
 mod upgrade;
