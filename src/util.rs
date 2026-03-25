@@ -46,10 +46,9 @@ pub fn nat_cmp(a: &str, b: &str) -> Ordering {
 
 /// Compute lowercase hex MD5 and SHA256 of a byte slice.
 pub fn hash_bytes(data: &[u8]) -> (String, String) {
-    use md5::Digest as _;
-    use sha2::Digest as _;
+    use md5::Digest;
     let md5 = hex::encode(md5::Md5::digest(data));
-    let sha256 = hex::encode(sha2::Sha256::digest(data));
+    let sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data));
     (md5, sha256)
 }
 

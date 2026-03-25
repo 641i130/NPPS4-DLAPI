@@ -2,212 +2,250 @@ NPPS4-DLAPI
 =====
 
 [![NPPS4 DLAPI Spec.: Version 1.1](https://img.shields.io/badge/NPPS4%20DLAPI%20Spec.-Version%201.1-bf88ba)](https://github.com/DarkEnergyProcessor/NPPS4-DLAPI)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 
-This is reference implementation and documentation of NPPS4 Download API protocol.
+A Rust rewrite of the [NPPS4-DLAPI reference implementation](https://github.com/DarkEnergyProcessor/NPPS4-DLAPI) — a CDN/download API server for Love Live! School Idol Festival (SIF) game assets, implementing the NPPS4 Download API protocol v1.1.
 
-Setup
+The original Python/FastAPI implementation is preserved upstream. This fork rewrites the server in Rust for:
+
+- **Memory safety** — Rust's ownership model eliminates entire classes of memory vulnerabilities (use-after-free, buffer overflows) at compile time, with no runtime GC pauses.
+- **Single binary deployment** — `cargo build --release` produces one self-contained binary. No Python interpreter, no venv, no pip.
+- **Lower resource usage** — significantly lower memory footprint and faster cold starts than uvicorn/FastAPI.
+- **Security hardened** — path traversal protection, input sanitization, and request size limits built in. See [Security](#security).
+
+The API is 100% wire-compatible with the original — any client or tool that works with the Python version works here unchanged.
+
+---
+
+Prerequisites
 -----
 
-Before running, ensure to have all SIF game files with these structure.
+- [Nix](https://nixos.org/) with flakes enabled (the dev environment provides everything else)
+- A prepared `archive-root` directory (see [Archive Structure](#archive-structure) below)
+
+Getting Started
+-----
+
+### 1. Enter the development shell
+
+```bash
+nix develop
+```
+
+This drops you into a shell with the Rust stable toolchain, `cargo`, and `cargo-watch` ready to use.
+
+### 2. Create a config file
+
+Copy the sample and edit it:
+
+```bash
+cp config.sample.toml config.toml
+$EDITOR config.toml
+```
+
+Minimum config:
+
+```toml
+[main]
+public = true
+shared_key = ""
+archive_root = "/absolute/path/to/archive-root"
+```
+
+### 3. Build and run
+
+```bash
+# Development (with logging)
+RUST_LOG=n4dlapi=info,tower_http=info cargo run
+
+# Production build
+cargo build --release
+./target/release/n4dlapi
+```
+
+The server listens on `127.0.0.1:8000` by default.
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `N4DLAPI_CONFIG_FILE` | `config.toml` | Path to the TOML config file |
+| `N4DLAPI_ARCHIVE_ROOT` | *(from config)* | Override the archive root directory |
+| `N4DLAPI_LISTEN` | `127.0.0.1:8000` | Listen address and port |
+| `RUST_LOG` | `n4dlapi=info` | Log level filter |
+
+### Live reload during development
+
+```bash
+cargo watch -x run
+```
+
+---
+
+Configuration
+-----
+
+Full reference for `config.toml`:
+
+```toml
+[main]
+# Make all API endpoints public by default (no shared key required).
+public = true
+
+# Optional shared key. Clients must send this in the DLAPI-Shared-Key header.
+# Empty string disables the shared key (all endpoints public).
+shared_key = ""
+
+# Path to the archive-root directory. Relative paths are resolved from CWD.
+# Absolute paths recommended. Overridden by N4DLAPI_ARCHIVE_ROOT env var.
+archive_root = "/srv/sif/archive-root"
+
+# Base URL used when constructing download links in API responses.
+# Set this when running behind a reverse proxy to prevent Host header injection.
+# Example: base_url = "https://dl.example.com"
+# base_url = ""
+
+# Per-endpoint visibility overrides:
+
+# Always serve /api/publicinfo publicly, even when public = false above.
+[api.publicinfo]
+public = true
+
+# Allow /api/v1/update without a shared key.
+# [api.v1.update]
+# public = true
+
+# Restrict /api/v1/getdb even when public = true.
+# [api.v1.getdb]
+# public = false
+```
+
+---
+
+CLI Tools
+-----
+
+The `n4dlapi` binary provides three subcommands. Run without a subcommand (or with `serve`) to start the API server.
+
+### `n4dlapi upgrade <archive-root>`
+
+Upgrades a generation 1.0 archive to generation 1.1, which is required before running the server. This:
+
+- Scans all update and package directories
+- Computes MD5/SHA256 hashes and writes `infov2.json` metadata files
+- Extracts micro-download files from package type 4 archives
+- Decrypts game databases (requires `honoka2` binary in PATH, or `python -m honkypy`)
+
+```bash
+n4dlapi upgrade /path/to/archive-root
+```
+
+Only needs to be run once per archive. A `generation.json` file is written when complete; subsequent runs will exit immediately if the archive is already at 1.1.
+
+### `n4dlapi clone <destination> <mirror> [options]`
+
+Clones a full game archive from a remote NPPS4-DLAPI v1.1 server to a local directory. Useful for setting up a mirror.
+
+```bash
+# Basic clone
+n4dlapi clone /srv/sif/archive-root https://your-mirror.example.com
+
+# With shared key authentication
+n4dlapi clone /srv/sif/archive-root https://your-mirror.example.com \
+    --shared-key "mysecretkey"
+
+# iOS only, starting from game version 60.0
+n4dlapi clone /srv/sif/archive-root https://your-mirror.example.com \
+    --no-android --base-version 60.0
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--shared-key <KEY>` | *(empty)* | Shared key for the remote server |
+| `--no-ios` | — | Skip iOS downloads |
+| `--no-android` | — | Skip Android downloads |
+| `--base-version <VER>` | `59.0` | Oldest game version to fetch updates from |
+
+Downloads are resumable: if interrupted, re-run the same command and it will continue from where it left off (resume state is stored as `update.json` / `package_N.json` files in the destination).
+
+After cloning, the archive is ready to use with `n4dlapi serve` directly — no separate `upgrade` step is needed.
+
+---
+
+Archive Structure
+-----
+
+The `archive-root` directory must be at generation **1.1**. Use `n4dlapi upgrade` to upgrade a generation 1.0 archive, or `n4dlapi clone` to create a fresh one from a remote server. See [CLI Tools](#cli-tools) below.
 
 ```
 archive-root/
 ├── {iOS,Android}/
 │   ├── update/
-│   │   ├── <client_version>/
-│   │   │   ├── 1.zip
-│   │   │   ├── 2.zip
-│   │   │   ├── ...
-│   │   │   ├── info.json
-│   │   │   └── infov2.json (*)
-│   │   ├── info.json
-│   │   └── infov2.json (*)
+│   │   ├── infov2.json              # List of available update versions
+│   │   └── <version>/               # e.g. "59.4"
+│   │       ├── 1.zip
+│   │       ├── 2.zip
+│   │       ├── ...
+│   │       ├── info.json
+│   │       └── infov2.json          # [{name, size, md5, sha256}, ...]
 │   └── package/
-│       ├── <client_version>/
-│       │   ├── <package_type>/
-│       │   │   ├── <package_id>/
-│       │   │   │   ├── 1.zip
-│       │   │   │   ├── 2.zip
-│       │   │   │   ├── ...
-│       │   │   │   ├── info.json
-│       │   │   │   └── infov2.json (*)
-│       │   │   └── info.json
-│       │   ├── db (*)
-│       │   │   └── *.db_
-│       │   ├── microdl/ (*)
-│       │   │   ├── assets/
-│       │   │   ├── config/
-│       │   │   ├── en/
-│       │   │   └── info.json
-│       │   └── microdl_map.json
-│       └── info.json
-├── release_info.json
-└── generation.json (*)
+│       ├── info.json                # List of available package versions
+│       └── <version>/
+│           ├── db/                  # Pre-decrypted database files
+│           │   └── *.db_
+│           ├── microdl/             # Extracted micro-download files
+│           │   ├── assets/
+│           │   ├── config/
+│           │   ├── en/
+│           │   └── info.json        # {filepath: {size, md5, sha256}}
+│           ├── microdl_map.json
+│           └── <package_type>/      # 0–6
+│               ├── info.json        # [package_id, ...]
+│               └── <package_id>/
+│                   ├── 1.zip
+│                   ├── 2.zip
+│                   ├── ...
+│                   ├── info.json
+│                   └── infov2.json  # [{name, size, md5, sha256}, ...]
+├── release_info.json                # {package_id: base64_key}
+└── generation.json                  # {"major": 1, "minor": 1}
 ```
 
-**\***: run `update_v1.1.py` script to upgrade the directory structure!
+### Package types
 
-### Explanation, all paths are relative to `archive-root`:
+| Value | Name | Package ID source |
+|---|---|---|
+| 0 | Bootstrap | Always 0 |
+| 1 | Live | `live_track_id` in `live/live.db_` |
+| 2 | Scenario | `scenario_chapter_id` in `scenario/scenario.db_` |
+| 3 | Subscenario | `unit_id` in `subscenario/subscenario.db_` |
+| 4 | Micro | Exposed via `release_info.json` |
+| 5 | Event Scenario | `event_scenario_id` in `event/event_common.db_` |
+| 6 | Multi Unit Scenario | `multi_unit_scenario_id` in `multi_unit_scenario/multi_unit_scenario.db_` |
 
-* `release_info.json` - Contains all keys used to decrypt game database rows.
+---
 
-* `{iOS,Android}` - Must be either `iOS` or `Android`. Will be referred to `<OS>` from now on.
-
-* `<OS>/update/info.json` - Contains list of available client versions in this update package, as an array.
-
-* `<OS>/update/<client_version>` - Contains necessary file for version update to `<client_version>`. Note that updates are not incremental, so for example, updating from version 59.0 to 59.4 will require serving all files for 59.1, 59.2, 59.3, and 59.4, in that order.
-
-* `<OS>/update/<client_version>/info.json` - Contains list of files for specific update version package, relative to `<OS>/update/<client_version>` directory, where the key is the filename and the value is the file size. The order follows the filename such that `2.zip` comes **after** `1.zip`, not `10.zip` (this sorting order will be referred to "natural sort" from now on).
-
-* `<OS>/update/<client_version>/external` - Contains extracted update files. Not needed.
-
-* `<OS>/package/info.json` - Contains list of all fully downloaded packages by `<client_version>`.
-
-* `<OS>/package/<client_version>/microdl_map.json` - Contains mapping of files which are served using micro download functionality. The key is the asset filename and the value is the archive path where this file reside, including the `archive-root/` directory.
-
-* `<OS>/package/<client_version>/<package_type>/info.json` - Contains list of `<package_id>`s for the corresponding `<package_type>`.
-
-* `<OS>/package/<client_version>/<package_type>/<package_id>/info.json` - Contains list of files for specific package type and id at specific client version, relative to `<OS>/update/<client_version>` directory, where the key is the filename and the value is the file size. Ordered by natural sorting order.
-
-### Example `release_info.json`:
-
-```json
-{
-	"423": "UDKkj/dmBRbz+CIB+Ekqyg==",
-	"1870": "Lckl38UoH8CfOMqMSmMYsA==",
-	"1871": "acAmAWyPOCrO+R5qY9UTtQ=="
-}
-```
-
-Protip: Complete keys gathered by the community are bundled as `release_info.json` in this repository.
-
-### Example `<OS>/update/info.json`
-
-```json
-["59.1", "59.2", "59.3", "59.4"]
-```
-
-### Example `<OS>/update/info.json`
-
-```json
-{
-	"1.zip": 12237086,
-	"2.zip": 8725394,
-	"3.zip": 1612,
-	"4.zip": 318
-}
-```
-
-### Example `<OS>/package/info.json`
-
-```json
-["59.1", "59.2", "59.3", "59.4"]
-```
-
-### Example `<OS>/package/<client_version>/microdl_map.json`, 10 data, random order
-
-```json
-{
-	// ...
-	"en/assets/image/sticker/tx_st_107_006.texb": "archive-root/iOS/package/59.4/4/0/336.zip",
-	"en/assets/image/secretbox/navi/tx_navi_77711124.texb": "archive-root/iOS/package/59.4/4/0/66.zip",
-	"assets/image/secretbox/appeal/tx_appeal_1255_a.texb": "archive-root/iOS/package/59.4/4/1820/1.zip",
-	"en/assets/image/secretbox/appeal/tx_appeal_1485_b.texb": "archive-root/iOS/package/59.4/4/0/277.zip",
-	"assets/image/units/tx_u_normal_card_52003002.texb": "archive-root/iOS/package/59.4/4/147/1.zip",
-	"assets/image/secretbox/title/tx_title_366_7.texb": "archive-root/iOS/package/59.4/4/1262/1.zip",
-	"en/assets/image/secretbox/appeal/tx_appeal_9991387.texb": "archive-root/iOS/package/59.4/4/0/37.zip",
-	"assets/image/multi_unit/scenario/tx_ch_ms_002_001.texb": "archive-root/iOS/package/59.4/4/248/1.zip",
-	"assets/image/units/tx_u_normal_navi_42002002.texb": "archive-root/iOS/package/59.4/4/0/130.zip",
-	"assets/sound/voice/navi/vo_na_106_0604.mp3": "archive-root/iOS/package/59.4/4/0/328.zip"
-	// ...
-}
-```
-
-Note: Usually the `microdl_map.json` is 7MB in size.
-
-### Example `<OS>/package/<client_version>/<package_type>/info.json`, where `<package_type>` is 1
-
-```json
-[
-	578, 579, 580, 583, 584, 585, 587, 588, 589, 590, 591, 592, 593, 594, 595, 596, 597, 598, 599, 600, 601, 602, 603,
-	604, 605, 606, 607, 614, 622, 623, 624, 625, 626, 627, 628, 629, 630, 631, 633, 634, 635, 636, 637, 638, 639, 640,
-	641, 642, 643, 644, 645, 646, 647, 648, 649, 652, 653, 654, 655, 656, 657, 658, 659, 660, 661, 662, 663, 664, 665,
-	666, 667, 668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678, 679, 680, 681, 682, 683, 684, 685, 686, 687, 688,
-	689, 690, 691, 692, 693, 694, 695, 696, 697, 698, 699, 700, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 712,
-	714, 715, 716, 717, 718, 719, 720, 721, 722, 723, 724, 725, 726, 727, 728, 729, 730, 731, 732, 733, 734, 735, 736,
-	737, 738, 739, 740, 741, 742, 743, 744, 745, 746, 747, 748, 749, 750, 751, 752, 753, 754, 755, 756, 757, 758, 759,
-	760, 761
-]
-```
-
-### Example `<OS>/package/<client_version>/<package_type>/<package_id>/info.json`, where `<package_type>` is 1 and `<package_id>` is 747
-
-```json
-{
-	"1.zip": 2131514,
-	"2.zip": 198
-}
-```
-
-For obvious reasons we can't provide download link to those files.
-
-Once you have those files, create new virtual environment and install the necessary dependencies.
-
-```
-python -m venv venv
-(activate venv)
-pip install --upgrade pip -r requirements.txt
-```
-
-Running
+API Reference
 -----
 
-After having your archive-root data, you need a configuration file in TOML text file before running the program.
-`config.sample.toml` can be used for reference.
-
-After you have your config file, run `N4DLAPI_CONFIG_FILE=path/to/config.toml uvicorn n4dlapi:app`. It will listen
-on `127.0.0.1:8000` as per uvicorn defaults.
-
-Protocol
------
-
-Anyone are allowed to implement NPPS4 DLAPI protocol without subject to zlib license restrictions. The zlib license restriction only applies **specifically to this reference implementation!**
-
-### Shared Key
-
-To protect from rogue requests, the DLAPI server can be protected using shared key. This is done by
-requiring `DLAPI-Shared-Key` header to match with the server-configured one. If it doesn't match, then
-a 404 will be returned for all API endpoints.
+All endpoints require the `DLAPI-Shared-Key` header if a shared key is configured, unless the endpoint is marked public. On failure the server returns HTTP 404 with `{"detail": "Not found."}` to avoid leaking information.
 
 <details>
 <summary><code>GET</code> <code><b>/api/publicinfo</b></code></summary>
 
-Retrieve information about the DLAPI server. A special configuration can be specified to
-always serve this public information without shared key header.
+Returns server metadata. Typically configured as always-public.
 
-#### Responses
-
+#### Response `200`
 ```jsonc
-// HTTP Code 200
 {
-	// Can the API be accessed publicly?
-	// This can still be false even if this endpoint is accessible.
-	"publicApi": true,
-	// NPPS4-DLAPI API compilance version.
-	// Note that there's no "patch" version. Only "major" and "minor" version.
-	"dlapiVersion": {
-		"major": 1,
-		"minor": 0
-	},
-	// How long the download link will last (in seconds)? 0 means last indefinitely.
-	"serveTimeLimit": 0,
-	// What's the latest game version?
-	"gameVersion": "59.4",
-
-	"application": {
-		// Application-specific data goes here.
-	}
+    "publicApi": true,
+    "dlapiVersion": { "major": 1, "minor": 1 },
+    "serveTimeLimit": 0,
+    "gameVersion": "59.4",
+    "application": {
+        "NPPS4DLAPICommit": "abc123...",
+        "NPPS4DLAPIVersion": "2023.05.14"
+    }
 }
 ```
 
@@ -216,109 +254,65 @@ always serve this public information without shared key header.
 <details>
 <summary><code>POST</code> <code><b>/api/v1/update</b></code></summary>
 
-Get download links for update package to the latest version available.
+Returns download links for all update packages between the client's current version and the latest available.
 
-#### Parameters
+#### Request body
+```json
+{ "version": "59.0", "platform": 2 }
+```
 
-> | name      | type     | data type      | description                              |
-> |-----------|----------|----------------|------------------------------------------|
-> | version   | required | string         | Old client version                       |
-> | platform  | required | int            | Platform type. 1 for iOS, 2 for Android. |
+| Field | Type | Description |
+|---|---|---|
+| `version` | string | Client's current version |
+| `platform` | int | `1` = iOS, `2` = Android |
 
-#### Responses (v1.1)
-
+#### Response `200`
 ```jsonc
-// HTTP Code 200
 [
-	// ... more items
-	// For each item in this array
-	{
-		// Direct link to download.
-		// Link must be publicly accessible even without Shared Key header.
-		"url": "http://localhost/download/update_59.4.zip",
-		// Archive size in bytes.
-		"size": 12345,
-		"checksums": {
-			// For checksums, MD5 and SHA256 is required.
-			// Other checksums for application-specific usage is allowed.
-			"md5": "d41d8cd98f00b204e9800998ecf8427e",
-			"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		},
-		// Update version
-		"version": "59.4"
-	}
-	// ... more items
+    {
+        "url": "http://host/archive-root/iOS/update/59.4/1.zip",
+        "size": 12345,
+        "checksums": { "md5": "...", "sha256": "..." },
+        "version": "59.4"
+    }
 ]
 ```
 
-#### Responses (v1.0)
-
-```jsonc
-// HTTP Code 200
-[
-	// ... more items
-	// For each item in this array
-	{
-		// Direct link to download.
-		// Link must be publicly accessible even without Shared Key header.
-		"url": "http://localhost/download/update_59.4.zip",
-		// Archive size in bytes.
-		"size": 12345,
-		"checksums": {
-			// For checksums, MD5 and SHA256 is required.
-			// Other checksums for application-specific usage is allowed.
-			"md5": "d41d8cd98f00b204e9800998ecf8427e",
-			"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		}
-	}
-	// ... more items
-]
-```
+Updates are not incremental — the response includes all intermediate versions in order.
 
 </details>
 
 <details>
 <summary><code>POST</code> <code><b>/api/v1/batch</b></code></summary>
 
-Get all download links of package IDs for specific package type.
+Returns download links for all packages of a given type.
 
-#### Parameters
+#### Request body
+```json
+{ "package_type": 1, "platform": 1, "exclude": [578, 579] }
+```
 
-> | name         | type     | data type   | description                                            |
-> |--------------|----------|-------------|--------------------------------------------------------|
-> | package_type | required | int         | Package type. See below for valid `package_type`s.     |
-> | platform     | required | int         | Platform type. 1 for iOS, 2 for Android.               |
-> | exclude      | optional | list of int | List of package ID to exclude. Defaults to empty list. |
+| Field | Type | Description |
+|---|---|---|
+| `package_type` | int | See package types table |
+| `platform` | int | `1` = iOS, `2` = Android |
+| `exclude` | int[] | Package IDs to skip (optional) |
 
-#### Possible HTTP Code
-
-* 200 - Request is fulfilled.
-* 404 - Package not found.
-
-#### Responses
-
+#### Response `200`
 ```jsonc
-// HTTP Code 200
 [
-	// ... more items
-	// For each item in this array
-	{
-		// Direct link to download.
-		// Link must be publicly accessible even without Shared Key header.
-		"url": "http://localhost/download/0_0_59.4.zip",
-		// The package ID group of this archive.
-		"packageId": 0,
-		// Archive size in bytes.
-		"size": 12345,
-		"checksums": {
-			// For checksums, MD5 and SHA256 is required.
-			// Other checksums for application-specific usage is allowed.
-			"md5": "d41d8cd98f00b204e9800998ecf8427e",
-			"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		}
-	}
-	// ... more items
+    {
+        "url": "http://host/archive-root/iOS/package/59.4/1/580/1.zip",
+        "size": 12345,
+        "checksums": { "md5": "...", "sha256": "..." },
+        "packageId": 580
+    }
 ]
+```
+
+#### Response `404`
+```json
+{ "detail": "Package type not found" }
 ```
 
 </details>
@@ -326,43 +320,27 @@ Get all download links of package IDs for specific package type.
 <details>
 <summary><code>POST</code> <code><b>/api/v1/download</b></code></summary>
 
-Get download links for specific package type and package id.
+Returns download links for a specific package.
 
-#### Parameters
+#### Request body
+```json
+{ "package_type": 1, "package_id": 747, "platform": 1 }
+```
 
-> | name         | type     | data type | description                                        |
-> |--------------|----------|-----------|----------------------------------------------------|
-> | package_type | required | int       | Package type. See below for valid `package_type`s. |
-> | package_id   | required | int       | Package ID. See below for possible `package_id`s.  |
-> | platform     | required | int       | Platform type. 1 for iOS, 2 for Android.           |
-
-#### Possible HTTP Code
-
-* 200 - Request is fulfilled.
-* 404 - Package not found.
-
-#### Responses
-
+#### Response `200`
 ```jsonc
-// HTTP Code 200
 [
-	// ... more items
-	// For each item in this array
-	{
-		// Direct link to download.
-		// Link must be publicly accessible even without Shared Key header.
-		"url": "http://localhost/download/0_0_59.4.zip",
-		// Archive size in bytes.
-		"size": 12345,
-		"checksums": {
-			// For checksums, MD5 and SHA256 is required.
-			// Other checksums for application-specific usage is allowed.
-			"md5": "d41d8cd98f00b204e9800998ecf8427e",
-			"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		}
-	}
-	// ... more items
+    {
+        "url": "http://host/archive-root/iOS/package/59.4/1/747/1.zip",
+        "size": 12345,
+        "checksums": { "md5": "...", "sha256": "..." }
+    }
 ]
+```
+
+#### Response `404`
+```json
+{ "detail": "Package not found" }
 ```
 
 </details>
@@ -370,122 +348,105 @@ Get download links for specific package type and package id.
 <details>
 <summary><code>GET</code> <code><b>/api/v1/getdb/{name}</b></code></summary>
 
-Get decrypted database file.
+Returns a pre-decrypted SQLite3 database file.
 
-#### Parameters
+The `name` parameter is sanitized to alphanumeric characters and underscores only.
 
-> | name | type     | data type | description          |
-> |------|----------|-----------|----------------------|
-> | name | required | string    | Name of the database |
+#### Response `200`
+Raw SQLite3 bytes. `Content-Type: application/vnd.sqlite3`
 
-#### Possible HTTP Code
-
-* 200 - Request is fulfilled. The contents of the whole SQLite3 database is sent. (`Content-Type: application/vnd.sqlite3`)
-* 404 - Database not found.
+#### Response `404`
+```json
+{ "detail": "Database not found" }
+```
 
 </details>
 
 <details>
 <summary><code>POST</code> <code><b>/api/v1/getfile</b></code></summary>
 
-Get single file from package type 4.
+Returns download info for individual micro-download files (package type 4). Maximum 1024 files per request.
 
-#### Parameters
+#### Request body
+```json
+{ "files": ["assets/image/tx_foo.texb", "en/assets/sound/vo_bar.mp3"], "platform": 1 }
+```
 
-> | name     | type     | data type      | description                              |
-> |----------|----------|----------------|------------------------------------------|
-> | files    | required | list of string | List of files to retrieve.               |
-> | platform | required | int            | Platform type. 1 for iOS, 2 for Android. |
-
-#### Possible HTTP Code
-
-* 200 - Request is fulfilled.
-
-#### Responses
+#### Response `200`
 ```jsonc
-// HTTP Code 200
 [
-	// ... more items
-	// For each item in this array
-	{
-		// Direct link to download.
-		// Link must be publicly accessible even without Shared Key header.
-		// If file is not found, then it still must provide valid-but-404 URL!
-		"url": "http://localhost/download/assets/image/tx_foo.texb",
-		// Archive size in bytes.
-		// If the file is not found, the size must be 0.
-		"size": 12345,
-		"checksums": {
-			// For checksums, MD5 and SHA256 is required.
-			// Other checksums for application-specific usage is allowed.
-			// If the file is not found, the hash of null input must be specified.
-			"md5": "d41d8cd98f00b204e9800998ecf8427e",
-			"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		}
-	}
-	// ... more items
+    {
+        "url": "http://host/archive-root/iOS/package/59.4/microdl/assets/image/tx_foo.texb",
+        "size": 12345,
+        "checksums": { "md5": "...", "sha256": "..." }
+    }
 ]
 ```
+
+If a file is not found, its entry still appears with `size: 0` and the MD5/SHA256 of empty input.
 
 </details>
 
 <details>
 <summary><code>GET</code> <code><b>/api/v1/release_info</b></code></summary>
 
-Get available `release_info` keys.
+Returns the decryption key map for package type 4.
 
-#### Parameters
-
-> | name | type     | data type | description          |
-> |------|----------|-----------|----------------------|
-> | name | required | string    | Name of the database |
-
-#### Possible HTTP Code
-
-* 200 - Request is fulfilled.
-
-#### Responses
+#### Response `200`
 ```jsonc
-// HTTP Code 200
 {
-	// ... keys
-	// The "key" is package_id for package_type 4, the value is gamedb row decryption key, base64-encoded.
-	"423": "UDKkj/dmBRbz+CIB+Ekqyg==",
-	"1874": "T18sDsU+81wLXTjCURNxJw=="
-	// ... keys
+    "423": "UDKkj/dmBRbz+CIB+Ekqyg==",
+    "1874": "T18sDsU+81wLXTjCURNxJw=="
 }
 ```
 
 </details>
 
-**Note**: Application-specific endpoint must go through `/api/app` path!
+### Static files
 
-### List of valid `<package_type>`s and where to find the `<package_id>`s:
+All archive files are served directly at `/archive-root/<path>` with no authentication required, so download URLs are always accessible by clients even when the API is key-protected.
 
-* 0: Always 0.
-* 1: `live_track_id` column in `live_track_m` table in `live/live.db_`
-* 2: `scenario_chapter_id` column in `scenario_chapter_m` table in `scenario/scenario.db_`.
-* 3: `unit_id` column in `subscenario_m` table in `subscenario/subscenario.db_`.
-* 4: Not available. All possible package_id is stored server-side and only exposed at certain times at `release_info.json` key ID.
-* 5: `event_scenario_id` column in `event_scenario_m` table in `event/event_common.db_`.
-* 6: `multi_unit_scenario_id` column in `multi_unit_scenario_m` table in `multi_unit_scenario/multi_unit_scenario.db_`.
+---
 
-Note: `included_pkg_m` in `bootstrap.db_` contains list of preloaded packages.
-
-Contributing
+Security
 -----
 
-Codebase in this reference implementation is formatted using [`black`](https://github.com/psf/black) formatter,
-with max line of 120 lines (`-l 120`).
+Compared to the original Python implementation this rewrite adds the following hardening:
 
-There's no CLA. Anyone is free to contribute.
+- **No memory unsafety** — Rust's compile-time guarantees eliminate buffer overflows, use-after-free, and data races entirely.
+- **Path traversal prevention** — database names are stripped to `[a-zA-Z0-9_]`; micro-download paths are normalised and all `..` components removed before any filesystem access.
+- **Host header injection fix** — set `base_url` in config to pin the base URL used in responses, preventing cache poisoning attacks in CDN deployments.
+- **Request size cap** — `/api/v1/getfile` is limited to 1024 files per request to prevent DoS via large arrays.
+- **Input validation** — platform and package type are validated as known integers before any file I/O.
+- **No shell execution** — no user input is ever passed to a subprocess or shell.
+
+---
+
+Reverse Proxy (nginx example)
+-----
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name dl.example.com;
+
+    location /archive-root/ {
+        proxy_pass http://127.0.0.1:8000;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Set `base_url = "https://dl.example.com"` in `config.toml` when behind a proxy.
+
+---
 
 License
 -----
 
-This reference implementation is licensed under zlib/libpng license.
-
-Note that certain helper files are licensed under MIT instead. This includes:
-
-* `update_v1.1.py`
-* `clone.py`
+This Rust implementation is licensed under the zlib/libpng license, matching the original upstream project.

@@ -215,7 +215,7 @@ fn prehash_package_type(
     platform: &str,
     version: (u32, u32),
     pkgtype: u8,
-    dbfiles: Option<&mut HashMap<String, Vec<u8>>>,
+    mut dbfiles: Option<&mut HashMap<String, Vec<u8>>>,
     extract_to: Option<&Path>,
 ) -> anyhow::Result<()> {
     let ver_str = version_string(version);
