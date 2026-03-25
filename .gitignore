@@ -1,7 +1,11 @@
 .vscode
-archive-root
-static
-venv
+archive-root/
+static/
+venv/
 *.pyc
+__pycache__/
 config.toml
-.claude/*
+.claude/
+# Rust build artifacts
+target/
+**/*.rs.bk
