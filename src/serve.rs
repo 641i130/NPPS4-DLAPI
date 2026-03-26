@@ -27,7 +27,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::info;
 
 use crate::config::Config;
@@ -415,13 +415,19 @@ pub async fn run() -> anyhow::Result<()> {
         git_commit: Arc::new(git_commit),
     };
 
+    // GET /api/v1/getdb/:name — needs wildcard CORS so external tools (e.g.
+    // sqlite-viewer) can fetch the database directly from the browser.
+    let getdb_route = Router::new()
+        .route("/api/v1/getdb/:name", get(getdb_handler))
+        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(state.clone(), verify_api_access));
+
     // API routes with access control middleware
     let api_routes = Router::new()
         .route("/api/publicinfo", get(publicinfo_handler))
         .route("/api/v1/update", post(update_handler))
         .route("/api/v1/batch", post(batch_handler))
         .route("/api/v1/download", post(download_handler))
-        .route("/api/v1/getdb/:name", get(getdb_handler))
         .route("/api/v1/getfile", post(getfile_handler))
         .route("/api/v1/release_info", get(release_info_handler))
         .layer(middleware::from_fn_with_state(state.clone(), verify_api_access));
@@ -432,6 +438,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/v7/micro_download/:platform/:version/*file_path", get(v7_microdl_handler));
 
     let app = Router::new()
+        .merge(getdb_route)
         .merge(api_routes)
         .merge(static_routes)
         .layer(TraceLayer::new_for_http())
