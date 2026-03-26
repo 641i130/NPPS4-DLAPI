@@ -27,7 +27,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
 use crate::config::Config;
@@ -432,9 +432,9 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/api/v1/release_info", get(release_info_handler))
         .layer(middleware::from_fn_with_state(state.clone(), verify_api_access));
 
-    // Static file serving for the CDN archive root
+    // /v7/micro_download is kept for legacy compatibility; /archive-root is
+    // served directly by nginx (bypassing this app entirely for performance).
     let static_routes = Router::new()
-        .nest_service("/archive-root", ServeDir::new(&archive_root))
         .route("/v7/micro_download/:platform/:version/*file_path", get(v7_microdl_handler));
 
     let app = Router::new()

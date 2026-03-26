@@ -102,7 +102,8 @@ archive_root = "/srv/sif/archive-root"
 
 # Base URL used when constructing download links in API responses.
 # Set this when running behind a reverse proxy to prevent Host header injection.
-# Example: base_url = "https://dl.example.com"
+# Include any path prefix if archive-root is served under a subpath.
+# Example: base_url = "https://dl.example.com/myapp"
 # base_url = ""
 
 # Per-endpoint visibility overrides:
@@ -270,7 +271,7 @@ Returns download links for all update packages between the client's current vers
 ```jsonc
 [
     {
-        "url": "http://host/archive-root/iOS/update/59.4/1.zip",
+        "url": "https://dl.example.com/myapp/archive-root/iOS/update/59.4/1.zip",
         "size": 12345,
         "checksums": { "md5": "...", "sha256": "..." },
         "version": "59.4"
@@ -302,7 +303,7 @@ Returns download links for all packages of a given type.
 ```jsonc
 [
     {
-        "url": "http://host/archive-root/iOS/package/59.4/1/580/1.zip",
+        "url": "https://dl.example.com/myapp/archive-root/iOS/package/59.4/1/580/1.zip",
         "size": 12345,
         "checksums": { "md5": "...", "sha256": "..." },
         "packageId": 580
@@ -331,7 +332,7 @@ Returns download links for a specific package.
 ```jsonc
 [
     {
-        "url": "http://host/archive-root/iOS/package/59.4/1/747/1.zip",
+        "url": "https://dl.example.com/myapp/archive-root/iOS/package/59.4/1/747/1.zip",
         "size": 12345,
         "checksums": { "md5": "...", "sha256": "..." }
     }
@@ -376,7 +377,7 @@ Returns download info for individual micro-download files (package type 4). Maxi
 ```jsonc
 [
     {
-        "url": "http://host/archive-root/iOS/package/59.4/microdl/assets/image/tx_foo.texb",
+        "url": "https://dl.example.com/myapp/archive-root/iOS/package/59.4/microdl/assets/image/tx_foo.texb",
         "size": 12345,
         "checksums": { "md5": "...", "sha256": "..." }
     }
@@ -404,7 +405,9 @@ Returns the decryption key map for package type 4.
 
 ### Static files
 
-All archive files are served directly at `/archive-root/<path>` with no authentication required, so download URLs are always accessible by clients even when the API is key-protected.
+Archive files are **not** served by the Rust application. They must be served directly by nginx (or another web server) from the `archive-root` directory on disk. The Rust app only produces the URLs — pointing to wherever nginx exposes that directory.
+
+The legacy `/v7/micro_download/:platform/:version/*path` endpoint is an exception: it is handled by the Rust app and returns `200` directly, for clients that use the old CDN path format.
 
 ---
 
@@ -430,11 +433,16 @@ server {
     listen 443 ssl;
     server_name dl.example.com;
 
-    location /archive-root/ {
-        proxy_pass http://127.0.0.1:8000;
+    # Serve archive files directly from disk — clients never hit the Rust app
+    # for these, which avoids the overhead of going through the application.
+    # Clients do not follow 3xx redirects, so this must return 200 directly.
+    location /myapp/archive-root/ {
+        alias /srv/sif/archive-root/;
+        autoindex off;
     }
 
-    location /api/ {
+    # API and legacy v7 routes go to the Rust application
+    location /myapp/ {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -442,7 +450,7 @@ server {
 }
 ```
 
-Set `base_url = "https://dl.example.com"` in `config.toml` when behind a proxy.
+Set `base_url = "https://dl.example.com/myapp"` in `config.toml` to match the path prefix nginx uses. The generated download URLs will then be `https://dl.example.com/myapp/archive-root/...`, which nginx resolves directly to disk without touching the Rust app.
 
 ---
 
