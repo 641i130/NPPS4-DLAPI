@@ -10,30 +10,30 @@ path = "src/main.rs"
 
 [dependencies]
 # Server
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.5", features = ["fs", "trace", "cors", "catch-panic"] }
+tower-http = { version = "0.7", features = ["fs", "trace", "cors", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = { version = "0.8", features = ["preserve_order"] }
+toml = { version = "0.9", features = ["preserve_order"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client (clone)
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "webpki-roots"] }
 
 # Archive handling (upgrade/clone)
-zip = "2"
+zip = "8"
 
 # Hashing (upgrade/clone)
-md-5 = "0.10"
-sha2 = "0.10"
+md-5 = "0.11"
+sha2 = "0.11"
 hex = "0.4"
 
 # URL encoding (clone shared key)

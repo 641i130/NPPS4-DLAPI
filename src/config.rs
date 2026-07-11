@@ -40,7 +40,11 @@ impl Config {
         let mut cfg = if std::path::Path::new(&config_file).is_file() {
             let raw = std::fs::read_to_string(&config_file)
                 .with_context(|| format!("Failed to read config file: {config_file}"))?;
-            let toml: toml::Value = raw.parse()
+            // Parse as a document (toml::Table): `str::parse::<toml::Value>()`
+            // stopped accepting whole documents in toml 0.9.
+            let toml: toml::Value = raw
+                .parse::<toml::Table>()
+                .map(toml::Value::Table)
                 .with_context(|| format!("Failed to parse TOML from: {config_file}"))?;
             Self::from_toml(toml)?
         } else {
@@ -202,7 +206,7 @@ mod tests {
             shared_key: shared_key.map(String::from),
             archive_root: PathBuf::from("archive-root"),
             base_url: None,
-            api_publicness: api_toml.parse().unwrap(),
+            api_publicness: api_toml.parse::<toml::Table>().map(toml::Value::Table).unwrap(),
         }
     }
 
