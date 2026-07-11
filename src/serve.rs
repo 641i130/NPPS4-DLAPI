@@ -363,6 +363,61 @@ async fn release_info_handler(State(state): State<AppState>) -> impl IntoRespons
     }
 }
 
+// ── Health check ───────────────────────────────────────────────────────────────
+
+/// GET /health
+///
+/// Liveness/readiness probe for reverse proxies and monitoring. Returns 200
+/// when the archive is readable, 503 when the process is up but the archive
+/// is broken — so operators can tell those two failure modes apart.
+/// Intentionally outside the shared-key middleware: it exposes nothing but
+/// the latest game version, which /api/publicinfo commonly exposes anyway.
+async fn health_handler(State(state): State<AppState>) -> Response {
+    let files = state.files.clone();
+    match run_blocking(move || files.get_latest_version()).await {
+        Ok((major, minor)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ok", "gameVersion": format!("{major}.{minor}") })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "degraded", "detail": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// ── Graceful shutdown ──────────────────────────────────────────────────────────
+
+/// Resolve when SIGTERM or Ctrl+C (SIGINT) is received, letting axum drain
+/// in-flight requests instead of dropping connections mid-response (which
+/// reverse proxies surface to users as 502 during every restart).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("Shutdown signal received, draining in-flight requests...");
+}
+
 // ── Legacy /v7 micro-download route ───────────────────────────────────────────
 
 /// GET /v7/micro_download/:platform/:version/*file_path
@@ -471,7 +526,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     // /v7/micro_download is kept for legacy compatibility.
     let static_routes = Router::new()
-        .route("/v7/micro_download/:platform/:version/*file_path", get(v7_microdl_handler));
+        .route("/v7/micro_download/:platform/:version/*file_path", get(v7_microdl_handler))
+        .route("/health", get(health_handler));
 
     // Serve /archive-root/* directly, like the original Python implementation
     // mounts StaticFiles there. Download URLs returned by the API point here,
@@ -497,6 +553,9 @@ pub async fn run() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     info!("Listening on http://{listen_addr}");
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    info!("Shutdown complete.");
     Ok(())
 }
