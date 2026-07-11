@@ -41,10 +41,13 @@ struct Cli {
 enum Commands {
     /// Start the download API server (default when no subcommand given).
     Serve,
-    /// Upgrade an archive-root from generation 1.0 to 1.1.
+    /// Upgrade an archive-root to the latest generation (currently 1.2).
     ///
-    /// This hashes all archives and writes infov2.json metadata files,
-    /// extracts microdl files, and decrypts game databases.
+    /// Runs the required stages in order. 1.0 -> 1.1 hashes all archives and
+    /// writes infov2.json metadata files, extracts microdl files, and decrypts
+    /// game databases (update_v1.1.py). 1.1 -> 1.2 renames archives to unique
+    /// "{n}_{sha256}.zip" names to prevent in-game download corruption
+    /// (update_v1.2.py).
     Upgrade(upgrade::UpgradeArgs),
     /// Clone a remote NPPS4-DLAPI server's archive to a local directory.
     ///
