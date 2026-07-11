@@ -320,7 +320,9 @@ async fn getdb_handler(
                         format!("attachment; filename=\"{db_name}.db_\""),
                     ),
                 ],
-                Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+                // 64 KiB chunks: the 4 KiB default costs a poll+frame per page and
+                // measurably hurts throughput on multi-MB databases.
+                Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024)),
             )
                 .into_response()
         }
@@ -440,7 +442,7 @@ async fn v7_microdl_handler(
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (header::CONTENT_LENGTH, meta.len().to_string()),
         ],
-        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+        Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024)),
     )
         .into_response()
 }
