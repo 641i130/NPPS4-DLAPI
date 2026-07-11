@@ -136,7 +136,10 @@ fn md5_digest(prefix: &[u8], basename: &[u8]) -> [u8; 16] {
 fn v2_step(update_key: u32) -> u32 {
     let a = (update_key >> 16) as u64;
     let low = (update_key & 0xFFFF) as u64;
-    let b = ((a * 0x41A70000) & 0x7FFFFFFF + low * 0x41A7) & 0xFFFFFFFF;
+    // The unusual grouping is intentional: Python's `&` also binds looser
+    // than `+`, so this faithfully mirrors honky-py's
+    // `(a * 0x41A70000) & 0x7FFFFFFF + (update_key & 0xFFFF) * 0x41A7`.
+    let b = ((a * 0x41A70000) & (0x7FFFFFFF + low * 0x41A7)) & 0xFFFFFFFF;
     let c = (a * 0x41A7) >> 15;
     let d = c + b;
     // Python: e = (d - 0x7FFFFFFF) % 2^32
@@ -223,4 +226,68 @@ fn decrypt_v3v4(
         update_key = update_key.wrapping_mul(lcg.a).wrapping_add(lcg.c);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decrypt;
+
+    // Test vectors generated with honky-py 0.2.0 (the reference
+    // implementation): each ciphertext is emit_header() + encrypted body for
+    // the same plaintext.
+    const PLAINTEXT_HEX: &str =
+        "53514c69746520666f726d6174203300746573742d706c61696e746578742d30313233343536373839";
+
+    fn check(basename: &str, ciphertext_hex: &str) {
+        let ciphertext = hex::decode(ciphertext_hex).unwrap();
+        let plaintext = hex::decode(PLAINTEXT_HEX).unwrap();
+        let out = decrypt(basename, &ciphertext).unwrap();
+        assert_eq!(out, plaintext, "wrong plaintext for {basename}");
+    }
+
+    #[test]
+    fn v2_jp() {
+        check(
+            "unit_unit.db_",
+            "de8092cd01084a097ce522e64ff24f615020170050655774097048614d6e50655c74093015321734113613381d",
+        );
+    }
+
+    #[test]
+    fn v3_ww() {
+        check(
+            "live_live.db_",
+            "c5f5820c000000000000085e000000002160687de8c37c3194286cf3ed06ed8a86e38b6bcae04daf277c4a2e41fbff26751bd205489b7c66fa",
+        );
+    }
+
+    #[test]
+    fn v3_tw_flipped_key() {
+        check(
+            "item_item.db_",
+            "a83fb10c000000010000092b00000000f38e4c33a03afef78817b92db2c413cc8dc31e547a3ddb6ec40cb87084df15760acfbed88006550955",
+        );
+    }
+
+    #[test]
+    fn v4_cn_lcg0() {
+        check(
+            "notes_notes.db_",
+            "02cb9d0c0000000200000000000000004dc52ce89356b816adb4eee9601e131fa2399ca0667309c853779dfcdfa7649f36a88395c96112dfb2",
+        );
+    }
+
+    #[test]
+    fn v4_jp_lcg3() {
+        check(
+            "festa_festa.db_",
+            "13e2590c000003020000000000000000517fce95e900740cc77efa2856027a9879cc1f224ad093e45b68754615a959022611648507ec9ea785",
+        );
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(decrypt("whatever.db_", &[0u8; 32]).is_err());
+        assert!(decrypt("whatever.db_", &[0u8; 2]).is_err());
+    }
 }

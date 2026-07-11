@@ -434,3 +434,177 @@ pub fn sanitize_path(file_path: &str) -> String {
     }
     components.join("/")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, content: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Minimal iOS-only archive: two update versions, one package version
+    /// with bootstrap/micro packages and a microdl index.
+    fn fixture() -> (tempfile::TempDir, FileState) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        write(root, "release_info.json", r#"{"1": "key1"}"#);
+
+        write(root, "iOS/package/info.json", r#"["59.2", "59.10"]"#);
+        write(root, "iOS/update/infov2.json", r#"["59.1", "59.2"]"#);
+        write(
+            root,
+            "iOS/update/59.1/infov2.json",
+            r#"[{"name": "1.zip", "size": 10, "md5": "m1", "sha256": "s1"},
+                {"name": "2.zip", "size": 20, "md5": "m2", "sha256": "s2"}]"#,
+        );
+        write(
+            root,
+            "iOS/update/59.2/infov2.json",
+            r#"[{"name": "1.zip", "size": 30, "md5": "m3", "sha256": "s3"}]"#,
+        );
+
+        write(root, "iOS/package/59.10/0/info.json", r#"[5, 3, 5]"#);
+        for id in [3, 5] {
+            write(
+                root,
+                &format!("iOS/package/59.10/0/{id}/infov2.json"),
+                &format!(r#"[{{"name": "1.zip", "size": {id}0, "md5": "m{id}", "sha256": "s{id}"}}]"#),
+            );
+        }
+        write(
+            root,
+            "iOS/package/59.10/4/10/infov2.json",
+            r#"[{"name": "1.zip", "size": 1, "md5": "x", "sha256": "y"}]"#,
+        );
+        write(root, "iOS/package/59.10/4/info.json", r#"[10]"#);
+        write(
+            root,
+            "iOS/package/59.10/microdl/info.json",
+            r#"{"external/known.bin": {"size": 77, "md5": "km", "sha256": "ks"}}"#,
+        );
+
+        let state = FileState::new(root.to_path_buf());
+        (dir, state)
+    }
+
+    #[test]
+    fn latest_version_sorts_numerically() {
+        let (_dir, state) = fixture();
+        // "59.10" > "59.2" numerically (ASCII sort would say otherwise)
+        assert_eq!(state.get_latest_version().unwrap(), (59, 10));
+    }
+
+    #[test]
+    fn update_returns_only_newer_versions_in_order() {
+        let (_dir, state) = fixture();
+        let downloads = state.get_update_file("59.0", 0).unwrap();
+        assert_eq!(downloads.len(), 3);
+        assert_eq!(downloads[0].version, "59.1");
+        assert_eq!(downloads[0].url, "/iOS/update/59.1/1.zip");
+        assert_eq!(downloads[1].url, "/iOS/update/59.1/2.zip");
+        assert_eq!(downloads[2].version, "59.2");
+
+        let mid = state.get_update_file("59.1", 0).unwrap();
+        assert_eq!(mid.len(), 1);
+        assert_eq!(mid[0].version, "59.2");
+    }
+
+    #[test]
+    fn update_up_to_date_and_ahead_return_empty() {
+        let (_dir, state) = fixture();
+        assert!(state.get_update_file("59.2", 0).unwrap().is_empty());
+        assert!(state.get_update_file("60.0", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_rejects_bad_version() {
+        let (_dir, state) = fixture();
+        assert!(state.get_update_file("garbage", 0).is_err());
+    }
+
+    #[test]
+    fn batch_dedupes_sorts_and_excludes() {
+        let (_dir, state) = fixture();
+        // info.json is [5, 3, 5]: dedupe to {3, 5}, sort ascending
+        let all = state.get_batch_list(0, 0, &[]).unwrap().unwrap();
+        assert_eq!(
+            all.iter().map(|d| d.package_id).collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+
+        let filtered = state.get_batch_list(0, 0, &[3]).unwrap().unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].package_id, 5);
+        assert_eq!(filtered[0].url, "/iOS/package/59.10/0/5/1.zip");
+    }
+
+    #[test]
+    fn batch_missing_type_is_none() {
+        let (_dir, state) = fixture();
+        assert!(state.get_batch_list(6, 0, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn single_package_found_and_missing() {
+        let (_dir, state) = fixture();
+        let found = state.get_single_package(0, 5, 0).unwrap().unwrap();
+        assert_eq!(found[0].url, "/iOS/package/59.10/0/5/1.zip");
+        assert_eq!(found[0].size, 50);
+        assert!(state.get_single_package(0, 999, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn microdl_known_file_gets_real_checksums() {
+        let (_dir, state) = fixture();
+        let info = state.get_microdl_file("external/known.bin", 0).unwrap();
+        assert_eq!(info.url, "iOS/package/59.10/microdl/external/known.bin");
+        assert_eq!(info.size, 77);
+        assert_eq!(info.checksums.md5, "km");
+    }
+
+    #[test]
+    fn microdl_unknown_file_gets_empty_checksums() {
+        let (_dir, state) = fixture();
+        let info = state.get_microdl_file("external/unknown.bin", 0).unwrap();
+        assert_eq!(info.size, 0);
+        assert_eq!(info.checksums.md5, MD5_EMPTY);
+        assert_eq!(info.checksums.sha256, SHA256_EMPTY);
+    }
+
+    #[test]
+    fn microdl_traversal_is_neutralized() {
+        let (_dir, state) = fixture();
+        let info = state.get_microdl_file("../../../etc/passwd", 0).unwrap();
+        assert!(!info.url.contains(".."));
+        assert!(info.url.starts_with("iOS/package/59.10/microdl/"));
+    }
+
+    #[test]
+    fn json_cache_picks_up_file_changes() {
+        let (dir, state) = fixture();
+        assert_eq!(state.get_latest_version().unwrap(), (59, 10));
+        // Rewrite with a newer version and a bumped mtime
+        let info = dir.path().join("iOS/package/info.json");
+        std::fs::write(&info, r#"["59.2", "60.0"]"#).unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = std::fs::File::open(&info).unwrap();
+        f.set_modified(later).unwrap();
+        assert_eq!(state.get_latest_version().unwrap(), (60, 0));
+    }
+
+    #[test]
+    fn sanitize_path_cases() {
+        assert_eq!(sanitize_path("a/b/c.bin"), "a/b/c.bin");
+        assert_eq!(sanitize_path("/leading/slash.bin"), "leading/slash.bin");
+        assert_eq!(sanitize_path("../../evil.bin"), "evil.bin");
+        assert_eq!(sanitize_path("a/./b.bin"), "a/b.bin");
+        // On Linux backslash is an ordinary character; removing ".." leaves
+        // the two literal backslashes in a single path component.
+        assert_eq!(sanitize_path("a\\..\\b.bin"), "a\\\\b.bin");
+        assert_eq!(sanitize_path(""), "");
+    }
+}

@@ -191,3 +191,75 @@ impl Config {
         self.main_public
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config(main_public: bool, shared_key: Option<&str>, api_toml: &str) -> Config {
+        Config {
+            main_public,
+            shared_key: shared_key.map(String::from),
+            archive_root: PathBuf::from("archive-root"),
+            base_url: None,
+            api_publicness: api_toml.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn no_shared_key_means_everything_accessible() {
+        let cfg = make_config(false, None, "");
+        assert!(cfg.is_accessible("/api/v1/download", None));
+        assert!(cfg.is_accessible("/api/publicinfo", None));
+    }
+
+    #[test]
+    fn shared_key_required_when_not_public() {
+        let cfg = make_config(false, Some("secret"), "");
+        assert!(!cfg.is_accessible("/api/v1/download", None));
+        assert!(!cfg.is_accessible("/api/v1/download", Some("wrong")));
+        assert!(cfg.is_accessible("/api/v1/download", Some("secret")));
+    }
+
+    #[test]
+    fn url_encoded_shared_key_accepted() {
+        // NPPS4 and clone.py send the key through urllib.parse.quote().
+        let cfg = make_config(false, Some("sekai+ichiban da"), "");
+        assert!(cfg.is_accessible("/api/v1/download", Some("sekai+ichiban da")));
+        assert!(cfg.is_accessible("/api/v1/download", Some("sekai%2Bichiban%20da")));
+        assert!(!cfg.is_accessible("/api/v1/download", Some("sekai%2Bwrong")));
+    }
+
+    #[test]
+    fn per_endpoint_override_opens_endpoint() {
+        let cfg = make_config(false, Some("secret"), "[publicinfo]\npublic = true");
+        assert!(cfg.is_accessible("/api/publicinfo", None));
+        assert!(!cfg.is_accessible("/api/v1/update", None));
+    }
+
+    #[test]
+    fn per_endpoint_override_closes_endpoint() {
+        let cfg = make_config(true, Some("secret"), "[v1.update]\npublic = false");
+        assert!(!cfg.is_accessible("/api/v1/update", None));
+        assert!(cfg.is_accessible("/api/v1/update", Some("secret")));
+        assert!(cfg.is_accessible("/api/v1/batch", None));
+    }
+
+    #[test]
+    fn getdb_override_does_not_cover_name_segment() {
+        // Parity with the Python reference: the endpoint walk requires an
+        // exact table for every path segment, so `[api.v1.getdb]` does NOT
+        // match "/api/v1/getdb/<name>" (the request always has a name
+        // segment) and the endpoint falls back to `main_public`. The
+        // reference implementation behaves the same way.
+        let cfg = make_config(true, Some("secret"), "[v1.getdb]\npublic = false");
+        assert!(cfg.is_accessible("/api/v1/getdb/main", None));
+    }
+
+    #[test]
+    fn non_api_paths_are_never_endpoint_public() {
+        let cfg = make_config(true, Some("secret"), "");
+        assert!(!cfg.is_endpoint_accessible("/archive-root/foo"));
+        assert!(!cfg.is_endpoint_accessible("/health"));
+    }
+}

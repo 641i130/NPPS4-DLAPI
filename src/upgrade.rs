@@ -446,3 +446,154 @@ fn prehash_packages(root: &Path, platform: &str) -> anyhow::Result<()> {
 fn decrypt_db(basename: &str, encrypted: &[u8]) -> anyhow::Result<Vec<u8>> {
     crate::honkypy::decrypt(basename, encrypted)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_json_str(root: &Path, rel: &str, content: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            for (name, data) in entries {
+                z.start_file(*name, opts).unwrap();
+                z.write_all(data).unwrap();
+            }
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn write_archive(root: &Path, rel_dir: &str, zips: &[Vec<u8>]) {
+        let dir = root.join(rel_dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut info = serde_json::Map::new();
+        for (i, data) in zips.iter().enumerate() {
+            let name = format!("{}.zip", i + 1);
+            fs::write(dir.join(&name), data).unwrap();
+            info.insert(name, serde_json::json!(data.len()));
+        }
+        fs::write(
+            dir.join("info.json"),
+            serde_json::to_string(&serde_json::Value::Object(info)).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // V2-encrypted "unit_unit.db_" produced by honky-py; plaintext below.
+    const ENCRYPTED_DB_HEX: &str =
+        "de8092cd01084a097ce522e64ff24f615020170050655774097048614d6e50655c74093015321734113613381d";
+    const DB_PLAINTEXT_HEX: &str =
+        "53514c69746520666f726d6174203300746573742d706c61696e746578742d30313233343536373839";
+
+    /// Build a minimal generation-1.0 archive (iOS only), run the full
+    /// upgrade, and check every 1.1 artifact (hashes, extracted microdl,
+    /// decrypted db) and every 1.2 artifact (renamed archives).
+    #[test]
+    fn full_upgrade_to_generation_1_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let encrypted_db = hex::decode(ENCRYPTED_DB_HEX).unwrap();
+        let db_plaintext = hex::decode(DB_PLAINTEXT_HEX).unwrap();
+
+        // update/59.1 carries the encrypted db
+        let upd = make_zip(&[("db/unit_unit.db_", &encrypted_db), ("a/asset.bin", b"hello")]);
+        write_archive(root, "iOS/update/59.1", &[upd]);
+
+        // package version 59.1 with bootstrap (0) and micro (4) types
+        write_json_str(root, "iOS/package/info.json", r#"["59.1"]"#);
+        let boot = make_zip(&[("bootstrap/b.bin", b"boot")]);
+        write_archive(root, "iOS/package/59.1/0/0", &[boot]);
+        write_json_str(root, "iOS/package/59.1/0/info.json", "[0]");
+        let micro_old = make_zip(&[("external/dup.bin", b"OLD"), ("external/one.bin", b"ONE")]);
+        let micro_new = make_zip(&[("external/dup.bin", b"NEW")]);
+        write_archive(root, "iOS/package/59.1/4/10", &[micro_old, micro_new]);
+        write_json_str(root, "iOS/package/59.1/4/info.json", "[10]");
+        for t in [1, 2, 3, 5, 6] {
+            write_json_str(root, &format!("iOS/package/59.1/{t}/info.json"), "[]");
+        }
+
+        run(UpgradeArgs { archive_root: root.to_path_buf() }).unwrap();
+
+        // Generation bumped to 1.2
+        let generation: Generation = read_json_file(&root.join("generation.json")).unwrap();
+        assert_eq!((generation.major, generation.minor), (1, 2));
+
+        // 1.1: db decrypted with the native honkypy port
+        let db = fs::read(root.join("iOS/package/59.1/db/unit_unit.db_")).unwrap();
+        assert_eq!(db, db_plaintext);
+
+        // 1.1: microdl extracted; later archive wins for duplicate files
+        let dup = fs::read(root.join("iOS/package/59.1/microdl/external/dup.bin")).unwrap();
+        assert_eq!(dup, b"NEW");
+        let one = fs::read(root.join("iOS/package/59.1/microdl/external/one.bin")).unwrap();
+        assert_eq!(one, b"ONE");
+        let microdl_info: serde_json::Value =
+            read_json_file(&root.join("iOS/package/59.1/microdl/info.json")).unwrap();
+        assert_eq!(microdl_info["external/dup.bin"]["size"], 3);
+
+        // 1.2: archives renamed to {n}_{sha256}{ext} and metadata rewritten
+        for rel in ["iOS/update/59.1", "iOS/package/59.1/0/0", "iOS/package/59.1/4/10"] {
+            let entries: Vec<FileEntry> = read_json_file(&root.join(rel).join("infov2.json")).unwrap();
+            assert!(!entries.is_empty(), "no entries in {rel}");
+            for entry in &entries {
+                assert_eq!(entry.name, format!("{}_{}.zip", entry.name.split('_').next().unwrap(), entry.sha256));
+                let file = root.join(rel).join(&entry.name);
+                assert!(file.is_file(), "missing renamed archive {}", file.display());
+                // Hash matches content
+                let (md5, sha256) = hash_bytes(&fs::read(&file).unwrap());
+                assert_eq!(md5, entry.md5);
+                assert_eq!(sha256, entry.sha256);
+            }
+            let infov1: HashMap<String, u64> = read_json_file(&root.join(rel).join("info.json")).unwrap();
+            assert_eq!(infov1.len(), entries.len());
+            for entry in &entries {
+                assert_eq!(infov1[&entry.name], entry.size);
+            }
+        }
+
+        // Idempotent: a second run is a no-op
+        run(UpgradeArgs { archive_root: root.to_path_buf() }).unwrap();
+    }
+
+    #[test]
+    fn upgrade_1_1_archive_only_runs_rename_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        write_json_str(root, "generation.json", r#"{"major": 1, "minor": 1}"#);
+        // Already-1.1 archive: infov2.json exists, one numeric and one
+        // non-numeric name (the latter must be skipped).
+        let data = b"zipdata";
+        let (md5, sha256) = hash_bytes(data);
+        fs::create_dir_all(root.join("iOS/update/59.1")).unwrap();
+        fs::write(root.join("iOS/update/59.1/1.zip"), data).unwrap();
+        fs::write(root.join("iOS/update/59.1/keep.zip"), data).unwrap();
+        write_json_str(
+            root,
+            "iOS/update/59.1/infov2.json",
+            &format!(
+                r#"[{{"name": "1.zip", "size": 7, "md5": "{md5}", "sha256": "{sha256}"}},
+                    {{"name": "keep.zip", "size": 7, "md5": "{md5}", "sha256": "{sha256}"}}]"#
+            ),
+        );
+        write_json_str(root, "iOS/update/infov2.json", r#"["59.1"]"#);
+        write_json_str(root, "iOS/package/info.json", "[]");
+
+        run(UpgradeArgs { archive_root: root.to_path_buf() }).unwrap();
+
+        assert!(root.join(format!("iOS/update/59.1/1_{sha256}.zip")).is_file());
+        assert!(root.join("iOS/update/59.1/keep.zip").is_file(), "non-numeric name must not be renamed");
+        let generation: Generation = read_json_file(&root.join("generation.json")).unwrap();
+        assert_eq!((generation.major, generation.minor), (1, 2));
+    }
+}

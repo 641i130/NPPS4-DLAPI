@@ -40,3 +40,6 @@ urlencoding = "2"
 
 # General
 anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
