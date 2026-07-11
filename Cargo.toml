@@ -25,7 +25,7 @@ toml = { version = "0.8", features = ["preserve_order"] }
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client (clone)
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 # Archive handling (upgrade/clone)
 zip = "2"
