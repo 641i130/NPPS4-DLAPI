@@ -465,10 +465,10 @@ fn make_microdl_map(ver_dir: &Path) -> anyhow::Result<()> {
             for i in 0..zip.len() {
                 let zf = zip.by_index(i)?;
                 let filename = zf.name().to_string();
-                // First occurrence wins (later archives in the sequence take precedence)
-                file_map.entry(filename).or_insert_with(|| {
-                    archive_path.to_string_lossy().into_owned()
-                });
+                // Last occurrence wins: clone.py overwrites the map entry as it
+                // walks package IDs and archives in ascending order, so files
+                // in later archives take precedence.
+                file_map.insert(filename, archive_path.to_string_lossy().into_owned());
             }
         }
     }

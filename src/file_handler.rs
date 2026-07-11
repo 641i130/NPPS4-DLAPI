@@ -19,10 +19,11 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::SystemTime,
 };
 use anyhow::{anyhow, Context};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::models::{
@@ -33,8 +34,13 @@ use crate::models::{
 pub const PLATFORM_MAP: &[&str] = &["iOS", "Android"];
 
 /// JSON cache keyed by file path, storing (mtime, parsed value).
+///
+/// Values are stored behind `Arc` so a cache hit is a cheap pointer clone.
+/// The microdl info.json on a real archive can be tens of megabytes; deep
+/// cloning it per lookup (while holding the cache lock) starves the whole
+/// server and can OOM it.
 pub struct JsonCache {
-    map: HashMap<PathBuf, (SystemTime, Value)>,
+    map: HashMap<PathBuf, (SystemTime, Arc<Value>)>,
 }
 
 impl JsonCache {
@@ -42,23 +48,25 @@ impl JsonCache {
         JsonCache { map: HashMap::new() }
     }
 
-    pub fn read_json(&mut self, path: &Path) -> anyhow::Result<Value> {
+    pub fn read_json(&mut self, path: &Path) -> anyhow::Result<Arc<Value>> {
         let meta = std::fs::metadata(path)
             .with_context(|| format!("Cannot stat: {}", path.display()))?;
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
         if let Some((cached_mtime, value)) = self.map.get(path) {
             if *cached_mtime >= mtime {
-                return Ok(value.clone());
+                return Ok(Arc::clone(value));
             }
         }
 
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("Cannot read: {}", path.display()))?;
-        let value: Value = serde_json::from_str(&raw)
-            .with_context(|| format!("Invalid JSON in: {}", path.display()))?;
+        let value: Arc<Value> = Arc::new(
+            serde_json::from_str(&raw)
+                .with_context(|| format!("Invalid JSON in: {}", path.display()))?,
+        );
 
-        self.map.insert(path.to_path_buf(), (mtime, value.clone()));
+        self.map.insert(path.to_path_buf(), (mtime, Arc::clone(&value)));
         Ok(value)
     }
 }
@@ -107,14 +115,20 @@ impl FileState {
         }
     }
 
-    fn read_json(&self, path: &Path) -> anyhow::Result<Value> {
-        self.json_cache.lock().unwrap().read_json(path)
+    fn read_json(&self, path: &Path) -> anyhow::Result<Arc<Value>> {
+        // A poisoned lock only means another thread panicked mid-read; the
+        // cache itself is still consistent, so keep serving rather than
+        // panicking on every subsequent request.
+        self.json_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read_json(path)
     }
 
     /// Return the index (0=iOS, 1=Android) of the platform that has package data.
     pub fn get_update_preference(&self) -> anyhow::Result<usize> {
         {
-            let pref = self.update_preference.lock().unwrap();
+            let pref = self.update_preference.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(p) = *pref {
                 return Ok(p);
             }
@@ -125,7 +139,7 @@ impl FileState {
                 .join("package")
                 .join("info.json");
             if info_path.is_file() {
-                *self.update_preference.lock().unwrap() = Some(i);
+                *self.update_preference.lock().unwrap_or_else(|e| e.into_inner()) = Some(i);
                 return Ok(i);
             }
         }
@@ -189,7 +203,7 @@ impl FileState {
             let files_path = ver_dir.join("infov2.json");
             let files_value = self.read_json(&files_path)?;
 
-            let entries: Vec<FileEntry> = serde_json::from_value(files_value)
+            let entries: Vec<FileEntry> = Vec::deserialize(&*files_value)
                 .with_context(|| format!("Bad infov2.json in {}", ver_dir.display()))?;
 
             for entry in entries {
@@ -254,7 +268,7 @@ impl FileState {
             let files_path = pkg_dir.join("infov2.json");
             let files_value = self.read_json(&files_path)?;
 
-            let entries: Vec<FileEntry> = serde_json::from_value(files_value)
+            let entries: Vec<FileEntry> = Vec::deserialize(&*files_value)
                 .with_context(|| format!("Bad infov2.json in {}", pkg_dir.display()))?;
 
             for entry in entries {
@@ -297,7 +311,7 @@ impl FileState {
 
         let files_path = pkg_dir.join("infov2.json");
         let files_value = self.read_json(&files_path)?;
-        let entries: Vec<FileEntry> = serde_json::from_value(files_value)
+        let entries: Vec<FileEntry> = Vec::deserialize(&*files_value)
             .with_context(|| format!("Bad infov2.json in {}", pkg_dir.display()))?;
 
         let result = entries
