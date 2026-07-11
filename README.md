@@ -130,18 +130,24 @@ The `n4dlapi` binary provides three subcommands. Run without a subcommand (or wi
 
 ### `n4dlapi upgrade <archive-root>`
 
-Upgrades a generation 1.0 archive to generation 1.1, which is required before running the server. This:
+Upgrades an archive to the latest generation (currently **1.2**), running the required stages in order. This is required before running the server.
+
+Generation 1.0 → 1.1 (equivalent to upstream `update_v1.1.py`):
 
 - Scans all update and package directories
 - Computes MD5/SHA256 hashes and writes `infov2.json` metadata files
 - Extracts micro-download files from package type 4 archives
 - Decrypts game databases using a native Rust implementation of the honkypy algorithm (no external tools required)
 
+Generation 1.1 → 1.2 (equivalent to upstream `update_v1.2.py`):
+
+- Renames numeric archive names (`1.zip`) to unique `1_<sha256>.zip` names, so a new game version can never reuse a URL for different content (this corrupted in-game downloads through caches)
+
 ```bash
 n4dlapi upgrade /path/to/archive-root
 ```
 
-Only needs to be run once per archive. A `generation.json` file is written when complete; subsequent runs will exit immediately if the archive is already at 1.1.
+Only needs to be run once per archive (and once more after this update, to move 1.1 archives to 1.2). A `generation.json` file is written when complete; subsequent runs exit immediately if the archive is already at the latest generation.
 
 ### `n4dlapi clone <destination> <mirror> [options]`
 
@@ -176,7 +182,7 @@ After cloning, the archive is ready to use with `n4dlapi serve` directly — no 
 Archive Structure
 -----
 
-The `archive-root` directory must be at generation **1.1**. Use `n4dlapi upgrade` to upgrade a generation 1.0 archive, or `n4dlapi clone` to create a fresh one from a remote server. See [CLI Tools](#cli-tools) below.
+The `archive-root` directory must be at generation **1.1** or newer (1.2 recommended). Use `n4dlapi upgrade` to bring an older archive up to date, or `n4dlapi clone` to create a fresh one from a remote server. See [CLI Tools](#cli-tools) below.
 
 ```
 archive-root/
