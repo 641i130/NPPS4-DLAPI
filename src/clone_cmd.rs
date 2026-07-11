@@ -64,6 +64,10 @@ pub struct CloneArgs {
     /// Updates are only fetched for versions newer than this baseline.
     #[arg(long, default_value = "59.0")]
     pub base_version: String,
+
+    /// Number of parallel download connections.
+    #[arg(long, default_value_t = 4)]
+    pub jobs: usize,
 }
 
 // ── Resume file structures (replace Python pickle) ────────────────────────────
@@ -271,9 +275,72 @@ fn expiry_string(dt: i64) -> String {
     parts.join(" ")
 }
 
+// ── Parallel downloader ────────────────────────────────────────────────────────
+
+struct DownloadJob {
+    url: String,
+    dest: PathBuf,
+    md5: String,
+    sha256: String,
+    label: String,
+}
+
+/// Download all jobs with up to `jobs` parallel connections. Each file is
+/// hash-verified and written to its destination. Stops (after in-flight
+/// downloads finish) and returns the first error encountered.
+fn download_all(client: &ApiClient, queue: Vec<DownloadJob>, jobs: usize) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if queue.is_empty() {
+        return Ok(());
+    }
+    let total = queue.len();
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(queue));
+    let started = AtomicUsize::new(0);
+    let failed: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.max(1).min(total) {
+            scope.spawn(|| loop {
+                if failed.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                    return;
+                }
+                let job = match queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
+                    Some(job) => job,
+                    None => return,
+                };
+                let n = started.fetch_add(1, Ordering::Relaxed) + 1;
+                println!("  [{n}/{total}] Downloading {}", job.label);
+
+                let result = client
+                    .download_file(&job.url)
+                    .and_then(|data| {
+                        verify_hash(&data, &job.md5, &job.sha256)
+                            .with_context(|| format!("Checksum failed for {}", job.url))?;
+                        Ok(data)
+                    })
+                    .and_then(|data| {
+                        fs::write(&job.dest, &data)
+                            .with_context(|| format!("Cannot write {}", job.dest.display()))
+                    });
+
+                if let Err(e) = result {
+                    *failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                    return;
+                }
+            });
+        }
+    });
+
+    match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 // ── Resume/continue update ─────────────────────────────────────────────────────
 
-fn continue_update(client: &ApiClient, platform_path: &Path) -> anyhow::Result<()> {
+fn continue_update(client: &ApiClient, platform_path: &Path, jobs: usize) -> anyhow::Result<()> {
     let resume_path = platform_path.join("update.json");
     if !resume_path.is_file() {
         return Ok(());
@@ -294,26 +361,39 @@ fn continue_update(client: &ApiClient, platform_path: &Path) -> anyhow::Result<(
         by_version.entry(entry.version.clone()).or_default().push(entry);
     }
 
+    // Phase 1: collect every missing file, download in parallel.
     let update_dir = platform_path.join("update");
+    let mut downloads = Vec::new();
+    for (version, files) in &by_version {
+        let ver_dir = update_dir.join(version);
+        fs::create_dir_all(&ver_dir)?;
+        if ver_dir.join("info.json").is_file() {
+            continue; // Version already complete
+        }
+        for (i, entry) in files.iter().enumerate() {
+            let name = format!("{}.zip", i + 1);
+            let dest = ver_dir.join(&name);
+            if !dest.is_file() {
+                downloads.push(DownloadJob {
+                    url: entry.url.clone(),
+                    dest,
+                    md5: entry.md5.clone(),
+                    sha256: entry.sha256.clone(),
+                    label: format!("update {version} {name}"),
+                });
+            }
+        }
+    }
+    download_all(client, downloads, jobs)?;
+
+    // Phase 2: write each version's info.json now that its files exist.
     for (version, files) in &by_version {
         let ver_dir = update_dir.join(version);
         let info_path = ver_dir.join("info.json");
-        fs::create_dir_all(&ver_dir)?;
-
         if !info_path.is_file() {
-            let count = files.len();
             let mut info_map: HashMap<String, u64> = HashMap::new();
             for (i, entry) in files.iter().enumerate() {
-                let name = format!("{}.zip", i + 1);
-                let dest = ver_dir.join(&name);
-                if !dest.is_file() {
-                    println!("  Downloading update {}/{count} {}", i + 1, dest.display());
-                    let data = client.download_file(&entry.url)?;
-                    verify_hash(&data, &entry.md5, &entry.sha256)
-                        .with_context(|| format!("Checksum failed for {}", entry.url))?;
-                    fs::write(&dest, &data)?;
-                }
-                info_map.insert(name, entry.size);
+                info_map.insert(format!("{}.zip", i + 1), entry.size);
             }
             write_json_file(&info_path, &info_map)?;
         }
@@ -357,7 +437,12 @@ fn prepare_update(
 
 // ── Resume/continue batch download ────────────────────────────────────────────
 
-fn continue_batch_download(client: &ApiClient, pkg_root: &Path, pkg_type: u8) -> anyhow::Result<()> {
+fn continue_batch_download(
+    client: &ApiClient,
+    pkg_root: &Path,
+    pkg_type: u8,
+    jobs: usize,
+) -> anyhow::Result<()> {
     let resume_path = pkg_root.join(format!("package_{pkg_type}.json"));
     if !resume_path.is_file() {
         return Ok(());
@@ -381,29 +466,38 @@ fn continue_batch_download(client: &ApiClient, pkg_root: &Path, pkg_type: u8) ->
         by_id.entry(entry.package_id).or_default().push(entry);
     }
 
+    // Phase 1: collect every missing file, download in parallel.
+    let mut downloads = Vec::new();
+    for (&pkg_id, files) in &by_id {
+        let id_dir = ver_type_path.join(pkg_id.to_string());
+        fs::create_dir_all(&id_dir)?;
+        if id_dir.join("info.json").is_file() {
+            continue; // Package already complete
+        }
+        for (i, entry) in files.iter().enumerate() {
+            let name = format!("{}.zip", i + 1);
+            let dest = id_dir.join(&name);
+            if !dest.is_file() {
+                downloads.push(DownloadJob {
+                    url: entry.url.clone(),
+                    dest,
+                    md5: entry.md5.clone(),
+                    sha256: entry.sha256.clone(),
+                    label: format!("package {pkg_type}/{pkg_id} {name}"),
+                });
+            }
+        }
+    }
+    download_all(client, downloads, jobs)?;
+
+    // Phase 2: write each package's info.json now that its files exist.
     for (&pkg_id, files) in &by_id {
         let id_dir = ver_type_path.join(pkg_id.to_string());
         let info_path = id_dir.join("info.json");
-        fs::create_dir_all(&id_dir)?;
-
         if !info_path.is_file() {
-            let count = files.len();
             let mut info_map: HashMap<String, u64> = HashMap::new();
             for (i, entry) in files.iter().enumerate() {
-                let name = format!("{}.zip", i + 1);
-                let dest = id_dir.join(&name);
-                if !dest.is_file() {
-                    println!(
-                        "  Downloading package {pkg_type}/{pkg_id} {}/{count} {}",
-                        i + 1,
-                        dest.display()
-                    );
-                    let data = client.download_file(&entry.url)?;
-                    verify_hash(&data, &entry.md5, &entry.sha256)
-                        .with_context(|| format!("Checksum failed for {}", entry.url))?;
-                    fs::write(&dest, &data)?;
-                }
-                info_map.insert(name, entry.size);
+                info_map.insert(format!("{}.zip", i + 1), entry.size);
             }
             write_json_file(&info_path, &info_map)?;
         }
@@ -512,11 +606,11 @@ pub fn run(args: CloneArgs) -> anyhow::Result<()> {
     // Resume any interrupted downloads before talking to the server
     println!("Checking for interrupted downloads...");
     for os in &oses {
-        continue_update(&client, &root.join(os))?;
+        continue_update(&client, &root.join(os), args.jobs)?;
     }
     for os in &oses {
         for pkg_type in 0u8..7 {
-            continue_batch_download(&client, &root.join(os).join("package"), pkg_type)?;
+            continue_batch_download(&client, &root.join(os).join("package"), pkg_type, args.jobs)?;
         }
     }
 
@@ -581,7 +675,7 @@ pub fn run(args: CloneArgs) -> anyhow::Result<()> {
             prepare_update(&root.join(os), &target_version_str, files, expire)?;
         }
         for os in &oses {
-            continue_update(&client, &root.join(os))?;
+            continue_update(&client, &root.join(os), args.jobs)?;
         }
     }
 
@@ -620,7 +714,7 @@ pub fn run(args: CloneArgs) -> anyhow::Result<()> {
 
     for os in &oses {
         for pkg_type in 0u8..7 {
-            continue_batch_download(&client, &root.join(os).join("package"), pkg_type)?;
+            continue_batch_download(&client, &root.join(os).join("package"), pkg_type, args.jobs)?;
         }
     }
 
