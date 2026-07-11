@@ -330,8 +330,9 @@ impl FileState {
         Ok(Some(result))
     }
 
-    /// Read a pre-decrypted database file. Returns `None` if not found.
-    pub fn get_database_file(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// Resolve a pre-decrypted database file to its on-disk path and size,
+    /// so the response can be streamed. Returns `None` if not found.
+    pub fn get_database_path(&self, name: &str) -> anyhow::Result<Option<(PathBuf, u64)>> {
         let pref = self.get_update_preference()?;
         let latest = self.get_latest_version()?;
         let ver_str = version_string(latest);
@@ -350,8 +351,9 @@ impl FileState {
             .join("db")
             .join(format!("{db_name}.db_"));
 
-        match std::fs::read(&db_path) {
-            Ok(data) => Ok(Some(data)),
+        match std::fs::metadata(&db_path) {
+            Ok(meta) if meta.is_file() => Ok(Some((db_path, meta.len()))),
+            Ok(_) => Ok(None),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
