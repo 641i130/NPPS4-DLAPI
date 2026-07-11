@@ -119,10 +119,11 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(result) => result,
-        Err(e) => Err(anyhow::anyhow!("blocking task failed: {e}")),
-    }
+    // block_in_place demotes this worker thread for the duration instead of
+    // dispatching to the blocking pool: same protection against stalling the
+    // runtime, without a per-request task hop. Panics unwind into
+    // CatchPanicLayer, which still turns them into a 500 response.
+    tokio::task::block_in_place(f)
 }
 
 fn database_not_found() -> Response {
@@ -320,9 +321,9 @@ async fn getdb_handler(
                         format!("attachment; filename=\"{db_name}.db_\""),
                     ),
                 ],
-                // 64 KiB chunks: the 4 KiB default costs a poll+frame per page and
+                // 256 KiB chunks: the 4 KiB default costs a poll+frame per page and
                 // measurably hurts throughput on multi-MB databases.
-                Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024)),
+                Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024)),
             )
                 .into_response()
         }
@@ -497,7 +498,7 @@ async fn v7_microdl_handler(
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (header::CONTENT_LENGTH, meta.len().to_string()),
         ],
-        Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024)),
+        Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024)),
     )
         .into_response()
 }
