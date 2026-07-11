@@ -409,6 +409,13 @@ Returns the decryption key map for package type 4.
 
 </details>
 
+<details>
+<summary><code>GET</code> <code><b>/health</b></code></summary>
+
+Liveness/readiness probe for reverse proxies and monitoring. Not part of the DLAPI spec; always accessible (no shared key). Returns `200` with `{"status": "ok", "gameVersion": "59.4"}` when the archive is readable, or `503` with `{"status": "degraded", "detail": "..."}` when the process is up but the archive is not servable.
+
+</details>
+
 ### Static files
 
 Archive files under `/archive-root/*` are served by the Rust application itself, exactly like the original Python implementation. A standalone deployment works out of the box: the download URLs produced by the API point back at this server.
@@ -458,6 +465,8 @@ server {
     }
 }
 ```
+
+The server shuts down gracefully on `SIGTERM`/`SIGINT`, draining in-flight requests first — restarts under systemd won't drop active downloads.
 
 Set `base_url = "https://dl.example.com/myapp"` in `config.toml` to match the path prefix nginx uses. The generated download URLs will then be `https://dl.example.com/myapp/archive-root/...`, which nginx resolves directly to disk without touching the Rust app.
 
