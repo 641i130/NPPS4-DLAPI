@@ -172,6 +172,7 @@ n4dlapi clone /srv/sif/archive-root https://your-mirror.example.com \
 | `--no-ios` | — | Skip iOS downloads |
 | `--no-android` | — | Skip Android downloads |
 | `--base-version <VER>` | `59.0` | Oldest game version to fetch updates from |
+| `--jobs <N>` | `4` | Number of parallel download connections |
 
 Downloads are resumable: if interrupted, re-run the same command and it will continue from where it left off (resume state is stored as `update.json` / `package_N.json` files in the destination).
 
