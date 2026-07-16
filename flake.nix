@@ -24,6 +24,7 @@
             rustToolchain
             pkgs.cargo-watch
             pkgs.pkg-config
+            pkgs.gh
           ];
 
           buildInputs = [
