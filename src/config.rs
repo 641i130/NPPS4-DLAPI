@@ -174,7 +174,15 @@ impl Config {
             return true;
         }
         match (&self.shared_key, sk) {
-            (Some(expected), Some(provided)) => expected == provided,
+            (Some(expected), Some(provided)) => {
+                // The DLAPI spec says the key is URL-encoded in the header
+                // (NPPS4 and clone clients send it percent-encoded), so accept
+                // both the raw and the decoded form.
+                expected == provided
+                    || urlencoding::decode(provided)
+                        .map(|decoded| decoded == *expected)
+                        .unwrap_or(false)
+            }
             _ => false,
         }
     }

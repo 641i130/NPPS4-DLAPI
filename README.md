@@ -366,7 +366,7 @@ Raw SQLite3 bytes. `Content-Type: application/vnd.sqlite3`
 <details>
 <summary><code>POST</code> <code><b>/api/v1/getfile</b></code></summary>
 
-Returns download info for individual micro-download files (package type 4). Maximum 1024 files per request.
+Returns download info for individual micro-download files (package type 4).
 
 #### Request body
 ```json
@@ -405,7 +405,9 @@ Returns the decryption key map for package type 4.
 
 ### Static files
 
-Archive files are **not** served by the Rust application. They must be served directly by nginx (or another web server) from the `archive-root` directory on disk. The Rust app only produces the URLs — pointing to wherever nginx exposes that directory.
+Archive files under `/archive-root/*` are served by the Rust application itself, exactly like the original Python implementation. A standalone deployment works out of the box: the download URLs produced by the API point back at this server.
+
+For high-traffic deployments, a reverse proxy (nginx) can still serve `/archive-root/` directly from disk and bypass the application — see the nginx example below. The application route is simply never reached in that case.
 
 The legacy `/v7/micro_download/:platform/:version/*path` endpoint is an exception: it is handled by the Rust app and returns `200` directly, for clients that use the old CDN path format.
 
@@ -419,7 +421,8 @@ Compared to the original Python implementation this rewrite adds the following h
 - **No memory unsafety** — Rust's compile-time guarantees eliminate buffer overflows, use-after-free, and data races entirely.
 - **Path traversal prevention** — database names are stripped to `[a-zA-Z0-9_]`; micro-download paths are normalised and all `..` components removed before any filesystem access.
 - **Host header injection fix** — set `base_url` in config to pin the base URL used in responses, preventing cache poisoning attacks in CDN deployments.
-- **Request size cap** — `/api/v1/getfile` is limited to 1024 files per request to prevent DoS via large arrays.
+- **Request body cap** — request bodies are limited to 64 MiB (the original has no limit at all).
+- **Panic isolation** — a panicking request handler returns HTTP 500 instead of dropping the connection (which reverse proxies would surface to users as 502 Bad Gateway).
 - **Input validation** — platform and package type are validated as known integers before any file I/O.
 - **No shell execution** — no user input is ever passed to a subprocess or shell.
 

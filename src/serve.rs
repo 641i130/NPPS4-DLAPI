@@ -20,14 +20,16 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    catch_panic::CatchPanicLayer, cors::CorsLayer, services::ServeDir, trace::TraceLayer,
+};
 use tracing::info;
 
 use crate::config::Config;
@@ -74,9 +76,6 @@ async fn verify_api_access(
     next.run(request).await
 }
 
-/// Maximum number of files accepted in a single /api/v1/getfile request.
-const GETFILE_MAX_FILES: usize = 1024;
-
 // ── URL builder ────────────────────────────────────────────────────────────────
 
 /// Build a full URL for a path under /archive-root/.
@@ -109,6 +108,24 @@ fn bad_request(msg: &str) -> Response {
         .into_response()
 }
 
+/// Run blocking filesystem work off the async runtime.
+///
+/// All `FileState` methods do synchronous file IO (and may parse very large
+/// JSON files); running them inline would stall tokio's worker threads and
+/// make the whole server unresponsive under load. This also isolates panics:
+/// a panicking task yields an error here instead of aborting the connection.
+async fn run_blocking<T, F>(f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    // block_in_place demotes this worker thread for the duration instead of
+    // dispatching to the blocking pool: same protection against stalling the
+    // runtime, without a per-request task hop. Panics unwind into
+    // CatchPanicLayer, which still turns them into a 500 response.
+    tokio::task::block_in_place(f)
+}
+
 fn internal_error() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -133,7 +150,8 @@ async fn publicinfo_handler(
     State(state): State<AppState>,
     _headers: HeaderMap,
 ) -> impl IntoResponse {
-    let (major, minor) = match state.files.get_latest_version() {
+    let files = state.files.clone();
+    let (major, minor) = match run_blocking(move || files.get_latest_version()).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("get_latest_version: {e}");
@@ -178,7 +196,9 @@ async fn update_handler(
         None => return bad_request("Invalid platform"),
     };
 
-    match state.files.get_update_file(&param.version, platform) {
+    let files = state.files.clone();
+    let version = param.version.clone();
+    match run_blocking(move || files.get_update_file(&version, platform)).await {
         Ok(mut downloads) => {
             for d in &mut downloads {
                 d.url = archive_url(&headers, state.config.base_url.as_deref(), &d.url);
@@ -203,7 +223,9 @@ async fn batch_handler(
         None => return bad_request("Invalid platform"),
     };
 
-    match state.files.get_batch_list(param.package_type, platform, &param.exclude) {
+    let files = state.files.clone();
+    let (package_type, exclude) = (param.package_type, param.exclude);
+    match run_blocking(move || files.get_batch_list(package_type, platform, &exclude)).await {
         Ok(Some(mut downloads)) => {
             for d in &mut downloads {
                 d.url = archive_url(&headers, state.config.base_url.as_deref(), &d.url);
@@ -233,7 +255,9 @@ async fn download_handler(
         None => return bad_request("Invalid platform"),
     };
 
-    match state.files.get_single_package(param.package_type, param.package_id, platform) {
+    let files = state.files.clone();
+    let (package_type, package_id) = (param.package_type, param.package_id);
+    match run_blocking(move || files.get_single_package(package_type, package_id, platform)).await {
         Ok(Some(mut downloads)) => {
             for d in &mut downloads {
                 d.url = archive_url(&headers, state.config.base_url.as_deref(), &d.url);
@@ -257,21 +281,28 @@ async fn getdb_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match state.files.get_database_file(&name) {
+    let files = state.files.clone();
+    let lookup_name = name.clone();
+    match run_blocking(move || files.get_database_file(&lookup_name)).await {
         Ok(Some(data)) => {
+            // Only ASCII survives here: header values must be valid HTTP, and
+            // a non-ASCII filename would make the response builder fail.
             let db_name: String = name
                 .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/vnd.sqlite3")
-                .header(
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{db_name}.db_\""),
-                )
-                .body(Body::from(data))
-                .unwrap()
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/vnd.sqlite3".to_string()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{db_name}.db_\""),
+                    ),
+                ],
+                data,
+            )
+                .into_response()
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -296,30 +327,35 @@ async fn getfile_handler(
         None => return bad_request("Invalid platform"),
     };
 
-    if param.files.len() > GETFILE_MAX_FILES {
-        return bad_request(&format!("Too many files requested (max {GETFILE_MAX_FILES})"));
-    }
+    let files = state.files.clone();
+    let requested = param.files;
+    let result = run_blocking(move || {
+        let mut results = Vec::with_capacity(requested.len());
+        for file_path in &requested {
+            results.push(files.get_microdl_file(file_path, platform)?);
+        }
+        Ok(results)
+    })
+    .await;
 
-    let mut results = Vec::with_capacity(param.files.len());
-    for file_path in &param.files {
-        match state.files.get_microdl_file(file_path, platform) {
-            Ok(mut info) => {
+    match result {
+        Ok(mut results) => {
+            for info in &mut results {
                 info.url = archive_url(&headers, state.config.base_url.as_deref(), &info.url);
-                results.push(info);
             }
-            Err(e) => {
-                tracing::error!("get_microdl_file({file_path}): {e}");
-                return internal_error();
-            }
+            (StatusCode::OK, Json(results)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("get_microdl_file: {e}");
+            internal_error()
         }
     }
-
-    (StatusCode::OK, Json(results)).into_response()
 }
 
 /// GET /api/v1/release_info
 async fn release_info_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match state.files.get_release_info() {
+    let files = state.files.clone();
+    match run_blocking(move || files.get_release_info()).await {
         Ok(map) => (StatusCode::OK, Json(map)).into_response(),
         Err(e) => {
             tracing::error!("get_release_info: {e}");
@@ -397,8 +433,10 @@ pub async fn run() -> anyhow::Result<()> {
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
+        .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
 
     info!("Git commit: {git_commit}");
@@ -432,16 +470,27 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/api/v1/release_info", get(release_info_handler))
         .layer(middleware::from_fn_with_state(state.clone(), verify_api_access));
 
-    // /v7/micro_download is kept for legacy compatibility; /archive-root is
-    // served directly by nginx (bypassing this app entirely for performance).
+    // /v7/micro_download is kept for legacy compatibility.
     let static_routes = Router::new()
         .route("/v7/micro_download/:platform/:version/*file_path", get(v7_microdl_handler));
 
+    // Serve /archive-root/* directly, like the original Python implementation
+    // mounts StaticFiles there. Download URLs returned by the API point here,
+    // so a standalone deployment must serve these files itself. A reverse
+    // proxy (nginx) MAY still intercept /archive-root for performance; this
+    // route is simply never reached in that case.
     let app = Router::new()
         .merge(getdb_route)
         .merge(api_routes)
         .merge(static_routes)
+        .nest_service("/archive-root", ServeDir::new(&archive_root))
         .layer(TraceLayer::new_for_http())
+        // A panicking handler must produce a 500 response; otherwise the
+        // connection is dropped and reverse proxies surface it as 502.
+        .layer(CatchPanicLayer::new())
+        // The original implementation imposes no request size limit; keep a
+        // generous cap so large /api/v1/getfile batches aren't rejected.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
 
     let listen_addr = std::env::var("N4DLAPI_LISTEN")
