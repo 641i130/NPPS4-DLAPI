@@ -126,6 +126,14 @@ where
     tokio::task::block_in_place(f)
 }
 
+fn database_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponseModel { detail: "Database not found".into() }),
+    )
+        .into_response()
+}
+
 fn internal_error() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -283,8 +291,20 @@ async fn getdb_handler(
 ) -> impl IntoResponse {
     let files = state.files.clone();
     let lookup_name = name.clone();
-    match run_blocking(move || files.get_database_file(&lookup_name)).await {
-        Ok(Some(data)) => {
+    match run_blocking(move || files.get_database_path(&lookup_name)).await {
+        Ok(Some((path, size))) => {
+            // Stream from disk instead of buffering the whole database
+            // (decrypted SIF databases can be tens of MB per request).
+            let file = match tokio::fs::File::open(&path).await {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return database_not_found();
+                }
+                Err(e) => {
+                    tracing::error!("open {}: {e}", path.display());
+                    return internal_error();
+                }
+            };
             // Only ASCII survives here: header values must be valid HTTP, and
             // a non-ASCII filename would make the response builder fail.
             let db_name: String = name
@@ -295,22 +315,21 @@ async fn getdb_handler(
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "application/vnd.sqlite3".to_string()),
+                    (header::CONTENT_LENGTH, size.to_string()),
                     (
                         header::CONTENT_DISPOSITION,
                         format!("attachment; filename=\"{db_name}.db_\""),
                     ),
                 ],
-                data,
+                // 256 KiB chunks: the 4 KiB default costs a poll+frame per page and
+                // measurably hurts throughput on multi-MB databases.
+                Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024)),
             )
                 .into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponseModel { detail: "Database not found".into() }),
-        )
-            .into_response(),
+        Ok(None) => database_not_found(),
         Err(e) => {
-            tracing::error!("get_database_file: {e}");
+            tracing::error!("get_database_path: {e}");
             internal_error()
         }
     }
@@ -455,18 +474,33 @@ async fn v7_microdl_handler(
         .join("microdl")
         .join(&sanitized_file);
 
-    match tokio::fs::read(&fs_path).await {
-        Ok(data) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(Body::from(data))
-            .unwrap(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, Json(ErrorResponseModel { detail: "Not found.".into() }))
-                .into_response()
-        }
-        Err(_) => internal_error(),
+    // Stream from disk instead of buffering the whole asset in memory.
+    let not_found = || {
+        (StatusCode::NOT_FOUND, Json(ErrorResponseModel { detail: "Not found.".into() }))
+            .into_response()
+    };
+    let file = match tokio::fs::File::open(&fs_path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return not_found(),
+        Err(_) => return internal_error(),
+    };
+    let meta = match file.metadata().await {
+        Ok(m) => m,
+        Err(_) => return internal_error(),
+    };
+    if !meta.is_file() {
+        return not_found();
     }
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, meta.len().to_string()),
+        ],
+        Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024)),
+    )
+        .into_response()
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────────
