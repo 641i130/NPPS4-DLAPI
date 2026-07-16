@@ -34,13 +34,15 @@ use crate::models::FileEntry;
 use crate::util::{hash_bytes, nat_cmp, parse_version, read_json_file, version_string, write_json_file};
 
 const PLATFORMS: &[&str] = &["iOS", "Android"];
-const GENERATION_VERSION: (u32, u32) = (1, 1);
+const GENERATION_1_1: (u32, u32) = (1, 1);
+const GENERATION_1_2: (u32, u32) = (1, 2);
+const GENERATION_LATEST: (u32, u32) = GENERATION_1_2;
 
 // ── CLI args ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Args)]
 pub struct UpgradeArgs {
-    /// Path to the archive-root directory to upgrade to generation 1.1.
+    /// Path to the archive-root directory to upgrade to the latest generation.
     pub archive_root: PathBuf,
 }
 
@@ -61,47 +63,139 @@ pub fn run(args: UpgradeArgs) -> anyhow::Result<()> {
     }
 
     let gen_path = root.join("generation.json");
-    let current_gen: (u32, u32) = if gen_path.is_file() {
+    let mut current_gen: (u32, u32) = if gen_path.is_file() {
         let g: Generation = read_json_file(&gen_path)?;
         (g.major, g.minor)
     } else {
         (1, 0)
     };
 
-    if current_gen == GENERATION_VERSION {
+    if current_gen == GENERATION_LATEST {
         println!("Archive is already up-to-date (generation {}.{}).", current_gen.0, current_gen.1);
         return Ok(());
     }
-    if current_gen > GENERATION_VERSION {
+    if current_gen > GENERATION_LATEST {
         return Err(anyhow!(
             "Archive generation {}.{} is newer than this tool supports ({}.{}).",
             current_gen.0, current_gen.1,
-            GENERATION_VERSION.0, GENERATION_VERSION.1
+            GENERATION_LATEST.0, GENERATION_LATEST.1
         ));
     }
 
-    for platform in PLATFORMS {
-        let plat_dir = root.join(platform);
-        if !plat_dir.is_dir() {
-            continue;
+    // Stage 1: 1.0 -> 1.1 (equivalent to update_v1.1.py)
+    if current_gen < GENERATION_1_1 {
+        println!("=== Upgrading generation {}.{} -> 1.1 ===", current_gen.0, current_gen.1);
+        for platform in PLATFORMS {
+            let plat_dir = root.join(platform);
+            if !plat_dir.is_dir() {
+                continue;
+            }
+            println!("===== OS: {platform} =====");
+            println!("Building update version list...");
+            build_new_update_info(root, platform)?;
+            println!("Hashing update archives...");
+            prehash_update(root, platform)?;
+            println!("Hashing package archives...");
+            prehash_packages(root, platform)?;
         }
-        println!("===== OS: {platform} =====");
-        println!("Building update version list...");
-        build_new_update_info(root, platform)?;
-        println!("Hashing update archives...");
-        prehash_update(root, platform)?;
-        println!("Hashing package archives...");
-        prehash_packages(root, platform)?;
+        write_json_file(
+            &gen_path,
+            &Generation { major: GENERATION_1_1.0, minor: GENERATION_1_1.1 },
+        )?;
+        current_gen = GENERATION_1_1;
+        println!("Archive is now generation {}.{}.", current_gen.0, current_gen.1);
     }
 
-    write_json_file(
-        &gen_path,
-        &Generation { major: GENERATION_VERSION.0, minor: GENERATION_VERSION.1 },
-    )?;
+    // Stage 2: 1.1 -> 1.2 (equivalent to update_v1.2.py)
+    if current_gen < GENERATION_1_2 {
+        println!("=== Upgrading generation {}.{} -> 1.2 ===", current_gen.0, current_gen.1);
+        for platform in PLATFORMS {
+            let plat_dir = root.join(platform);
+            if !plat_dir.is_dir() {
+                continue;
+            }
+            println!("===== OS: {platform} =====");
+            upgrade_1_2_platform(root, platform)?;
+        }
+        write_json_file(
+            &gen_path,
+            &Generation { major: GENERATION_1_2.0, minor: GENERATION_1_2.1 },
+        )?;
+        current_gen = GENERATION_1_2;
+        println!("Archive is now generation {}.{}.", current_gen.0, current_gen.1);
+    }
+
     println!(
         "Done. Archive is now generation {}.{}.",
-        GENERATION_VERSION.0, GENERATION_VERSION.1
+        current_gen.0, current_gen.1
     );
+    Ok(())
+}
+
+// ── Generation 1.2: unique archive filenames ──────────────────────────────────
+//
+// Port of update_v1.2.py: rename numeric archive names ("1.zip") to
+// "{n}_{sha256}.zip" so a new game version can never reuse an URL for
+// different content, which corrupted in-game downloads through caches.
+
+/// Rename the archives listed in `dir/infov2.json` to `{name}_{sha256}{ext}`
+/// and rewrite both `infov2.json` and `info.json` to match.
+fn fixnames(dir: &Path) -> anyhow::Result<()> {
+    let infov2_path = dir.join("infov2.json");
+    let mut entries: Vec<FileEntry> = read_json_file(&infov2_path)?;
+
+    for entry in &mut entries {
+        // Split off the extension the way Python's os.path.splitext does.
+        let (stem, ext) = match entry.name.rfind('.') {
+            Some(i) if i > 0 => entry.name.split_at(i),
+            _ => (entry.name.as_str(), ""),
+        };
+
+        // Only rename plain numeric names ("1.zip"); anything else (including
+        // already-renamed "1_<sha256>.zip") is left alone, so this is
+        // idempotent and safe to re-run.
+        if stem.parse::<i64>().is_err() {
+            println!("Skipping rename {}", dir.join(&entry.name).display());
+            continue;
+        }
+
+        let new_name = format!("{stem}_{}{ext}", entry.sha256);
+        fs::rename(dir.join(&entry.name), dir.join(&new_name))
+            .with_context(|| format!("Cannot rename {} in {}", entry.name, dir.display()))?;
+        println!("Renamed {} to {new_name}", entry.name);
+        entry.name = new_name;
+    }
+
+    // info.json maps name -> size, in the same order as infov2.json.
+    let mut infov1 = serde_json::Map::new();
+    for entry in &entries {
+        infov1.insert(entry.name.clone(), serde_json::json!(entry.size));
+    }
+    write_json_file(&infov2_path, &entries)?;
+    write_json_file(&dir.join("info.json"), &infov1)
+}
+
+fn upgrade_1_2_platform(root: &Path, platform: &str) -> anyhow::Result<()> {
+    let plat_dir = root.join(platform);
+
+    // Update archives
+    let update_versions: Vec<String> = read_json_file(&plat_dir.join("update").join("infov2.json"))?;
+    for ver in &update_versions {
+        fixnames(&plat_dir.join("update").join(ver))?;
+    }
+
+    // Package archives
+    let package_versions: Vec<String> = read_json_file(&plat_dir.join("package").join("info.json"))?;
+    for ver in &package_versions {
+        for package_type in 0u8..7 {
+            let type_dir = plat_dir.join("package").join(ver).join(package_type.to_string());
+            let ids: Vec<i64> = read_json_file(&type_dir.join("info.json"))?;
+            for id in ids {
+                fixnames(&type_dir.join(id.to_string()))?;
+            }
+        }
+    }
+
     Ok(())
 }
 
