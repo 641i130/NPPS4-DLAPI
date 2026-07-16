@@ -284,7 +284,7 @@ async fn download_handler(
     }
 }
 
-/// GET /api/v1/getdb/:name
+/// GET /api/v1/getdb/{name}
 async fn getdb_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -440,7 +440,7 @@ async fn shutdown_signal() {
 
 // ── Legacy /v7 micro-download route ───────────────────────────────────────────
 
-/// GET /v7/micro_download/:platform/:version/*file_path
+/// GET /v7/micro_download/{platform}/{version}/{*file_path}
 ///
 /// Reverse-maps the old v7 CDN path format to the current archive-root layout:
 ///   /v7/micro_download/{platform}/{version}/{file}
@@ -542,10 +542,10 @@ pub async fn run() -> anyhow::Result<()> {
         git_commit: Arc::new(git_commit),
     };
 
-    // GET /api/v1/getdb/:name — needs wildcard CORS so external tools (e.g.
+    // GET /api/v1/getdb/{name} — needs wildcard CORS so external tools (e.g.
     // sqlite-viewer) can fetch the database directly from the browser.
     let getdb_route = Router::new()
-        .route("/api/v1/getdb/:name", get(getdb_handler))
+        .route("/api/v1/getdb/{name}", get(getdb_handler))
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn_with_state(state.clone(), verify_api_access));
 
@@ -561,7 +561,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // /v7/micro_download is kept for legacy compatibility.
     let static_routes = Router::new()
-        .route("/v7/micro_download/:platform/:version/*file_path", get(v7_microdl_handler))
+        .route("/v7/micro_download/{platform}/{version}/{*file_path}", get(v7_microdl_handler))
         .route("/health", get(health_handler));
 
     // Serve /archive-root/* directly, like the original Python implementation
